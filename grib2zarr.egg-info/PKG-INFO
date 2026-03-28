@@ -1,3 +1,16 @@
+Metadata-Version: 2.4
+Name: grib2zarr
+Version: 0.1.0
+Summary: Extract parameters from GRIB2 files and store them in Zarr format
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: eccodes>=2.30.0
+Requires-Dist: xarray>=2023.1.0
+Requires-Dist: zarr>=2.14.0
+Requires-Dist: dask[array]>=2023.1.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: pyyaml>=6.0
+
 # grib2zarr
 
 Extract parameters from a GRIB2 file and store them in a [Zarr](https://zarr.dev/) store using asyncio.

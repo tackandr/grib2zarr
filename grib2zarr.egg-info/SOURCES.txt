@@ -1,0 +1,10 @@
+README.md
+config_parser.py
+grib2zarr.py
+pyproject.toml
+grib2zarr.egg-info/PKG-INFO
+grib2zarr.egg-info/SOURCES.txt
+grib2zarr.egg-info/dependency_links.txt
+grib2zarr.egg-info/entry_points.txt
+grib2zarr.egg-info/requires.txt
+grib2zarr.egg-info/top_level.txt
