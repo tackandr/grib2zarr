@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import List
 
 import xarray as xr
+import zarr
 from eccodes import (
     codes_get,
     codes_get_values,
@@ -332,35 +333,24 @@ async def write_slice(
     nx = da_var.sizes[dim_names[-1]]
     grid = values.reshape(ny, nx)
 
-    # Build the numpy index tuple and the zarr region dict
+    # Build the numpy index tuple for writing directly into the zarr array.
+    # Integer indices are used for the time and vertical dimensions so that
+    # only the single target slice is overwritten.
     np_idx = []
-    region = {}
     for dim in dim_names:
         if dim in spatial_dims:
             np_idx.append(slice(None))
-            region[dim] = slice(None)
         elif dim in ds.coords and ds.coords[dim].attrs.get("axis") == "T":
-            # Time dimension – identified by CF axis attribute
             np_idx.append(t_idx)
-            region[dim] = slice(t_idx, t_idx + 1)
         else:
-            # Vertical dimension
             np_idx.append(z_idx)
-            region[dim] = slice(z_idx, z_idx + 1)
 
-    # Assign to in-memory array
-    ds[var_name].values[tuple(np_idx)] = grid
-
-    # Write the slice to the Zarr store.
-    isel_dict = {}
-    for d in dim_names:
-        if d in spatial_dims:
-            continue
-        if d in ds.coords and ds.coords[d].attrs.get("axis") == "T":
-            isel_dict[d] = slice(t_idx, t_idx + 1)
-        else:
-            isel_dict[d] = slice(z_idx, z_idx + 1)
-    ds[[var_name]].isel(isel_dict).to_zarr(zarr_path, mode="r+", region=region)
+    # Write directly to the Zarr store.  The dataset data variables are
+    # backed by lazy dask arrays, so modifying ``ds[var_name].values`` only
+    # updates a temporary computed copy and never persists.  Opening the store
+    # with zarr and indexing directly avoids that problem.
+    store = zarr.open(zarr_path, mode="r+")
+    store[var_name][tuple(np_idx)] = grid
 
 
 async def producer(

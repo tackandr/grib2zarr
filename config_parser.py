@@ -136,6 +136,11 @@ def build_dataset(config: dict) -> xr.Dataset:
             else:
                 values = np.array(_eval_values(info["values"]))
             cf_attrs = dict(info.get("cf", {}))
+            if ref_time is not None:
+                # xarray manages the ``units`` encoding for datetime64 arrays
+                # automatically.  Keeping a user-supplied ``units`` attr would
+                # cause a "Key already exists" conflict during to_zarr encoding.
+                cf_attrs.pop("units", None)
             coords[name] = xr.Variable(name, values, attrs=cf_attrs)
 
             # Auxiliary parameter variables (e.g. a/b for hybrid levels)
