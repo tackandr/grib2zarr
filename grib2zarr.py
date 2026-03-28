@@ -68,8 +68,13 @@ def _build_var_matcher(config: dict) -> list:
     """Build a list of variable matchers from a parsed config.
 
     Each entry is a tuple ``(var_name, grib2_keys, dims)`` where *grib2_keys*
-    is a dict of the GRIB2 identification keys for that variable and *dims* is
-    the list of dimension reference dicts as written in the config.
+    is a dict of the combined GRIB2 identification keys for that variable —
+    its own discipline/parameterCategory/parameterNumber keys **plus** any
+    ``grib2`` keys declared on its dimension references (e.g.
+    ``typeOfFirstFixedSurface`` from the vertical coordinate).  Including the
+    vertical-coordinate keys ensures that two variables sharing the same
+    parameter numbers but placed on different level types (e.g. hybrid-sigma
+    vs. height-above-ground) are matched uniquely.
 
     Parameters
     ----------
@@ -85,6 +90,13 @@ def _build_var_matcher(config: dict) -> list:
         var_name = var["name"]
         grib2_keys = dict(var.get("grib2", {}))
         dims = var.get("dims", [])
+        # Merge grib2 keys from dimension references so that level-type keys
+        # (e.g. typeOfFirstFixedSurface) become part of the variable match.
+        for dim_ref in dims:
+            if isinstance(dim_ref, dict):
+                dim_grib2 = dim_ref.get("grib2", {})
+                if dim_grib2:
+                    grib2_keys.update(dim_grib2)
         matchers.append((var_name, grib2_keys, dims))
     return matchers
 
