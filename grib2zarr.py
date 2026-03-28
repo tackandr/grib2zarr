@@ -1,8 +1,8 @@
 """
 grib2zarr.py - Extract GRIB2 messages and store them in Zarr format using asyncio.
 
-This module reads a GRIB2 file, extracts parameters described by a YAML
-configuration file, and writes the data into a Zarr store.  A
+This module reads one or more GRIB2 files, extracts parameters described by a
+YAML configuration file, and writes the data into a Zarr store.  A
 producer/consumer pattern is used with asyncio.Queue to decouple reading
 from writing.
 
@@ -11,17 +11,18 @@ parameterNumber keys.  Dataset shape, chunk layout, coordinates, CRS and
 CF attributes are all derived from the configuration file.
 
 Usage:
-    python grib2zarr.py <grib_file_path> [output_zarr_path] --config CONFIG
+    python grib2zarr.py GRIB_FILE [GRIB_FILE ...] --config CONFIG [--output ZARR_PATH]
 
 Example:
-    python grib2zarr.py fc2026032709+001grib2_mbr000 myfile.zarr --config config.yaml
+    python grib2zarr.py fc2026032709+001grib2_mbr000 fc2026032709+002grib2_mbr000 \\
+        --config config.yaml --output myfile.zarr
 """
 
 import argparse
 import asyncio
 import sys
 from datetime import datetime
-from typing import List
+from typing import List, Union
 
 import xarray as xr
 import zarr
@@ -201,7 +202,7 @@ def _find_time_index(msg_keys: dict, dims: list):
     return 0
 
 
-async def read_grib(grib_file_path: str, matchers: list):
+async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
     """Async generator yielding matched GRIB messages.
 
     Each yielded item is a tuple::
@@ -225,11 +226,16 @@ async def read_grib(grib_file_path: str, matchers: list):
 
     Parameters
     ----------
-    grib_file_path:
-        Path to the GRIB2 file to read.
+    grib_file_paths:
+        Path (or list of paths) to the GRIB2 file(s) to read.  When a list
+        is supplied all files are processed in order as if they were
+        concatenated.
     matchers:
         List produced by :func:`_build_var_matcher`.
     """
+    if isinstance(grib_file_paths, str):
+        grib_file_paths = [grib_file_paths]
+
     # Pre-compute the union of all GRIB key names that need to be fetched.
     # This covers both variable-identification keys (from each variable's
     # grib2 dict) and dimension-identification keys (from each dim's grib2
@@ -243,52 +249,53 @@ async def read_grib(grib_file_path: str, matchers: list):
             if isinstance(dim_ref, dict):
                 keys_needed.update(dim_ref.get("grib2", {}).keys())
 
-    with open(grib_file_path, "rb") as f:
-        while True:
-            gid = codes_grib_new_from_file(f)
-            if gid is None:
-                break
-
-            level = codes_get(gid, "level", ktype=int)
-
-            # Fetch all keys required for matching in one pass.
-            # Request values as ``int`` (ktype=int) so that coded keys such as
-            # ``typeOfFirstFixedSurface`` are always returned as integers
-            # (e.g. 105) rather than string abbreviations (e.g. 'ml').
-            # This ensures the values match the integer constants declared in
-            # the config YAML.
-            msg_keys: dict = {}
-            for key in keys_needed:
-                try:
-                    msg_keys[key] = codes_get(gid, key, ktype=int)
-                except Exception:
-                    try:
-                        msg_keys[key] = codes_get(gid, key)
-                    except Exception:
-                        pass  # Key absent in this message type
-
-            matched = None
-            for var_name, grib2_keys, dims in matchers:
-                if all(msg_keys.get(k) == v for k, v in grib2_keys.items()):
-                    matched = (var_name, dims)
+    for grib_file_path in grib_file_paths:
+        with open(grib_file_path, "rb") as f:
+            while True:
+                gid = codes_grib_new_from_file(f)
+                if gid is None:
                     break
 
-            if matched is not None:
-                var_name, dims = matched
-                z_idx = _find_level_index(level, msg_keys, dims)
-                t_idx = _find_time_index(msg_keys, dims)
-                if z_idx is not None and t_idx is not None:
-                    values = codes_get_values(gid)
-                    codes_release(gid)
-                    yield (var_name, t_idx, z_idx, values)
+                level = codes_get(gid, "level", ktype=int)
+
+                # Fetch all keys required for matching in one pass.
+                # Request values as ``int`` (ktype=int) so that coded keys such as
+                # ``typeOfFirstFixedSurface`` are always returned as integers
+                # (e.g. 105) rather than string abbreviations (e.g. 'ml').
+                # This ensures the values match the integer constants declared in
+                # the config YAML.
+                msg_keys: dict = {}
+                for key in keys_needed:
+                    try:
+                        msg_keys[key] = codes_get(gid, key, ktype=int)
+                    except Exception:
+                        try:
+                            msg_keys[key] = codes_get(gid, key)
+                        except Exception:
+                            pass  # Key absent in this message type
+
+                matched = None
+                for var_name, grib2_keys, dims in matchers:
+                    if all(msg_keys.get(k) == v for k, v in grib2_keys.items()):
+                        matched = (var_name, dims)
+                        break
+
+                if matched is not None:
+                    var_name, dims = matched
+                    z_idx = _find_level_index(level, msg_keys, dims)
+                    t_idx = _find_time_index(msg_keys, dims)
+                    if z_idx is not None and t_idx is not None:
+                        values = codes_get_values(gid)
+                        codes_release(gid)
+                        yield (var_name, t_idx, z_idx, values)
+                    else:
+                        codes_release(gid)
                 else:
                     codes_release(gid)
-            else:
-                codes_release(gid)
 
-            # Yield control back to the event loop between messages so that
-            # the consumer can make progress while reading is ongoing.
-            await asyncio.sleep(0)
+                # Yield control back to the event loop between messages so that
+                # the consumer can make progress while reading is ongoing.
+                await asyncio.sleep(0)
 
 
 async def write_slice(
@@ -355,7 +362,7 @@ async def write_slice(
 
 async def producer(
     queue: asyncio.Queue,
-    grib_file_path: str,
+    grib_file_paths: Union[str, List[str]],
     matchers: list,
 ) -> None:
     """Read GRIB messages and push them onto *queue*.
@@ -367,12 +374,12 @@ async def producer(
     ----------
     queue:
         Shared asyncio queue.
-    grib_file_path:
-        Path to the GRIB2 file.
+    grib_file_paths:
+        Path (or list of paths) to the GRIB2 file(s).
     matchers:
         List produced by :func:`_build_var_matcher`.
     """
-    async for message in read_grib(grib_file_path, matchers):
+    async for message in read_grib(grib_file_paths, matchers):
         await queue.put(message)
     await queue.put(None)  # Sentinel – no more messages
 
@@ -403,13 +410,13 @@ async def consumer(
         queue.task_done()
 
 
-async def main(grib_file_path: str, zarr_path: str, config_path: str) -> None:
+async def main(grib_file_paths: Union[str, List[str]], zarr_path: str, config_path: str) -> None:
     """Orchestrate the producer/consumer pipeline.
 
     Parameters
     ----------
-    grib_file_path:
-        Path to the GRIB2 file to read.
+    grib_file_paths:
+        Path (or list of paths) to the GRIB2 file(s) to read.
     zarr_path:
         Destination Zarr store path.
     config_path:
@@ -421,30 +428,40 @@ async def main(grib_file_path: str, zarr_path: str, config_path: str) -> None:
     var_names = [m[0] for m in matchers]
 
     queue: asyncio.Queue = asyncio.Queue()
-    producer_task = asyncio.create_task(producer(queue, grib_file_path, matchers))
+    producer_task = asyncio.create_task(producer(queue, grib_file_paths, matchers))
     consumer_task = asyncio.create_task(consumer(queue, ds, zarr_path))
 
     await asyncio.gather(producer_task)
     await queue.join()
     await consumer_task
 
+    if isinstance(grib_file_paths, list):
+        files_str = ", ".join(f"'{p}'" for p in grib_file_paths)
+    else:
+        files_str = f"'{grib_file_paths}'"
     print(
         f"Done. Variables {', '.join(var_names)} written to '{zarr_path}' "
-        f"using config '{config_path}'."
+        f"from {files_str} using config '{config_path}'."
     )
 
 
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "Extract parameters from a GRIB2 file and store them in Zarr."
+            "Extract parameters from one or more GRIB2 files and store them in Zarr."
         )
     )
-    parser.add_argument("grib_file", help="Path to the input GRIB2 file.")
     parser.add_argument(
-        "zarr_path",
-        nargs="?",
+        "grib_files",
+        nargs="+",
+        metavar="GRIB_FILE",
+        help="Path(s) to one or more input GRIB2 files.",
+    )
+    parser.add_argument(
+        "--output",
         default=DEFAULT_ZARR_PATH,
+        metavar="ZARR_PATH",
+        dest="zarr_path",
         help=f"Output Zarr store path (default: {DEFAULT_ZARR_PATH}).",
     )
     parser.add_argument(
@@ -462,5 +479,5 @@ def _parse_args(argv=None):
 
 if __name__ == "__main__":
     args = _parse_args(sys.argv[1:])
-    asyncio.run(main(args.grib_file, args.zarr_path, args.config))
+    asyncio.run(main(args.grib_files, args.zarr_path, args.config))
 
