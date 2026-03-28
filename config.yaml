@@ -1,0 +1,186 @@
+# config.yaml – Example CF-conventions dataset configuration.
+#
+# Describes a two-type vertical grid:
+#   • 65 hybrid sigma-pressure levels (typeOfFirstFixedSurface: 105)
+#   • 1 height level at 0 m                (typeOfFirstFixedSurface: 103)
+#
+# YAML anchors (&name) and aliases (*name) are used so that dimension
+# definitions are written once and referenced in multiple variables.
+
+coordinates:
+  - hybrid: &hybrid
+      name: hybrid
+      grib2:
+        typeOfFirstFixedSurface: 105
+      cf:
+        axis: "Z"
+        computed_standard_name:  "air_pressure"   # custom attribute; not CF standard
+        formula:                 "p(n,k,j,i) = ap(k) + b(k)*ps(n,j,i)"
+        formula_terms:           "ap: a b: b ps: ps"
+        positive:                "down"
+        standard_name:           "atmosphere_hybrid_sigma_pressure_coordinate"
+      values: '[i for i in range(1, 66)]'
+      parameters:
+        - name: a
+          cf:
+            units: Pa
+          values: [1.00000000e+03, 3.00010645e+03, 5.00115479e+03, 6.95667749e+03,
+                   8.77213452e+03, 1.04011909e+04, 1.18459741e+04, 1.31087896e+04,
+                   1.41920586e+04, 1.50983027e+04, 1.58310938e+04, 1.63934111e+04,
+                   1.67861377e+04, 1.70112500e+04, 1.70738154e+04, 1.69817324e+04,
+                   1.67453867e+04, 1.63772471e+04, 1.58914238e+04, 1.53032041e+04,
+                   1.46285864e+04, 1.38838340e+04, 1.30850645e+04, 1.22478862e+04,
+                   1.13870869e+04, 1.05163853e+04, 9.64824316e+03, 8.79373242e+03,
+                   7.96246167e+03, 7.16254956e+03, 6.40063745e+03, 5.68193970e+03,
+                   5.01031982e+03, 4.38838794e+03, 3.81761084e+03, 3.29843225e+03,
+                   2.83039807e+03, 2.41228137e+03, 2.04220618e+03, 1.71776794e+03,
+                   1.43614850e+03, 1.19376190e+03, 9.86165466e+02, 8.09110718e+02,
+                   6.58961487e+02, 5.32382584e+02, 4.26338120e+02, 3.38084015e+02,
+                   2.65156296e+02, 2.05356636e+02, 1.56736115e+02, 1.17577885e+02,
+                   8.63794899e+01, 6.18351898e+01, 4.28186264e+01, 2.83661928e+01,
+                   1.76612406e+01, 1.00193365e+01, 4.87473726e+00, 1.76825249e+00,
+                   3.36721778e-01, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+                   0.00000000e+00]
+          dims:
+            - *hybrid
+
+        - name: b
+          cf:
+            units: 1
+          values: [0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 4.77340014e-04,
+                   2.39018997e-03, 6.22448511e-03, 1.19905453e-02, 1.96991405e-02,
+                   2.93618012e-02, 4.09907661e-02, 5.46247046e-02, 7.03164451e-02,
+                   8.80625620e-02, 1.07799556e-01, 1.29433420e-01, 1.52842231e-01,
+                   1.77879512e-01, 2.04378203e-01, 2.32155055e-01, 2.61015214e-01,
+                   2.90756807e-01, 3.21175337e-01, 3.52067754e-01, 3.83236021e-01,
+                   4.14490208e-01, 4.45650935e-01, 4.76551235e-01, 5.07037848e-01,
+                   5.36971956e-01, 5.66229433e-01, 5.94700754e-01, 6.22290492e-01,
+                   6.48916513e-01, 6.74509048e-01, 6.99009657e-01, 7.22369999e-01,
+                   7.44550526e-01, 7.65519381e-01, 7.85251111e-01, 8.03725421e-01,
+                   8.20926160e-01, 8.36873174e-01, 8.51647526e-01, 8.65336537e-01,
+                   8.78005385e-01, 8.89716595e-01, 9.00530040e-01, 9.10503030e-01,
+                   9.19690460e-01, 9.28144991e-01, 9.35917228e-01, 9.43055868e-01,
+                   9.49608028e-01, 9.55619395e-01, 9.61134464e-01, 9.66196746e-01,
+                   9.70849037e-01, 9.75133717e-01, 9.79092896e-01, 9.82768834e-01,
+                   9.86204296e-01, 9.89445955e-01, 9.92544860e-01, 9.95552182e-01,
+                   9.98519629e-01]
+          dims:
+            - *hybrid
+
+      chunk: 1
+
+  - height0: &height0
+      name: height0
+      grib2:
+        typeOfFirstFixedSurface: 103
+      cf:
+        axis: Z
+        standard_name: height
+        units: m
+      values: [0]
+      chunk: 1
+
+  - steps: &steps
+      name: steps
+      cf:
+        axis: T
+        standard_name: forecast_period
+        units: hours
+      values: '[i for i in range(1, 49)]'
+      chunk: 1
+
+  - x: &x
+      name: x
+      cf:
+        axis: X
+        standard_name: projection_x_coordinate
+        units: m
+      values: '[i * 2500 for i in range(949)]'
+      chunk: 949
+
+  - y: &y
+      name: y
+      cf:
+        axis: Y
+        standard_name: projection_y_coordinate
+        units: m
+      values: '[i * 2500 for i in range(1069)]'
+      chunk: 1069
+
+geometries:
+  - projection_lambert: &lambert
+      name: lambert
+      grib2:
+        shapeOfTheEarth: 6
+        gridDefinitionTemplateNumber: 30
+        Nx: 949
+        Ny: 1069
+        latitudeOfFirstGridPoint: 50319616
+        longitudeOfFirstGridPoint: 278280
+        LaD: 63300000
+        LoV: 15000000
+        Dx: 2500000
+        Dy: 2500000
+        scanningMode: 64
+        Latin1: 63300000
+        Latin2: 63300000
+      cf:
+        crs:
+          grid_mapping_name: lambert_conformal_conic
+          standard_parallel: [63.3, 63.3]
+          longitude_of_central_meridian: 15.0
+          latitude_of_projection_origin: 63.3
+          false_easting: 1060122.0
+          false_northing: 1332567.0
+          earth_radius: 6371229.0
+        coords:
+          - *y
+          - *x
+
+variables:
+  - name: dd
+    cf:
+      standard_name: wind_from_direction
+      long_name: wind direction
+      units: degree
+    grib2:
+      discipline: 0
+      parameterCategory: 2
+      parameterNumber: 0
+    geometry: *lambert
+    dims:
+      - *steps
+      - *hybrid
+      - *y
+      - *x
+
+  - name: ff
+    cf:
+      standard_name: wind_speed
+      long_name: wind speed
+      units: m s-1
+    grib2:
+      discipline: 0
+      parameterCategory: 2
+      parameterNumber: 1
+    geometry: *lambert
+    dims:
+      - *steps
+      - *hybrid
+      - *y
+      - *x
+
+  - name: uhel-m2s2
+    cf:
+      long_name: updraft helicity
+      units: m2 s-2
+    grib2:
+      discipline: 0
+      parameterCategory: 2
+      parameterNumber: 197
+    geometry: *lambert
+    dims:
+      - *steps
+      - *height0
+      - *y
+      - *x
