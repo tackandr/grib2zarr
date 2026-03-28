@@ -248,15 +248,23 @@ async def read_grib(grib_file_path: str, matchers: list):
             if gid is None:
                 break
 
-            level = codes_get(gid, "level")
+            level = codes_get(gid, "level", ktype=int)
 
-            # Fetch all keys required for matching in one pass
+            # Fetch all keys required for matching in one pass.
+            # Request values as ``int`` (ktype=int) so that coded keys such as
+            # ``typeOfFirstFixedSurface`` are always returned as integers
+            # (e.g. 105) rather than string abbreviations (e.g. 'ml').
+            # This ensures the values match the integer constants declared in
+            # the config YAML.
             msg_keys: dict = {}
             for key in keys_needed:
                 try:
-                    msg_keys[key] = codes_get(gid, key)
+                    msg_keys[key] = codes_get(gid, key, ktype=int)
                 except Exception:
-                    pass  # Key absent in this message type
+                    try:
+                        msg_keys[key] = codes_get(gid, key)
+                    except Exception:
+                        pass  # Key absent in this message type
 
             matched = None
             for var_name, grib2_keys, dims in matchers:
