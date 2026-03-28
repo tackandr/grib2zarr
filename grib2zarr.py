@@ -1,8 +1,8 @@
 """
 grib2zarr.py - Extract GRIB2 messages and store them in Zarr format using asyncio.
 
-This module reads a GRIB2 file, extracts parameters described by a YAML
-configuration file, and writes the data into a Zarr store.  A
+This module reads one or more GRIB2 files, extracts parameters described by a
+YAML configuration file, and writes the data into a Zarr store.  A
 producer/consumer pattern is used with asyncio.Queue to decouple reading
 from writing.
 
@@ -11,18 +11,21 @@ parameterNumber keys.  Dataset shape, chunk layout, coordinates, CRS and
 CF attributes are all derived from the configuration file.
 
 Usage:
-    python grib2zarr.py <grib_file_path> [output_zarr_path] --config CONFIG
+    python grib2zarr.py GRIB_FILE [GRIB_FILE ...] --config CONFIG [--output ZARR_PATH]
 
 Example:
-    python grib2zarr.py fc2026032709+001grib2_mbr000 myfile.zarr --config config.yaml
+    python grib2zarr.py fc2026032709+001grib2_mbr000 fc2026032709+002grib2_mbr000 \\
+        --config config.yaml --output myfile.zarr
 """
 
 import argparse
 import asyncio
 import sys
-from typing import List
+from datetime import datetime
+from typing import List, Union
 
 import xarray as xr
+import zarr
 from eccodes import (
     codes_get,
     codes_get_values,
@@ -34,6 +37,10 @@ from config_parser import build_dataset, load_config, _eval_values
 
 # Default output path
 DEFAULT_ZARR_PATH = "myfile.zarr"
+
+# Named constants used in time-index matching
+_SECONDS_PER_HOUR: float = 3600.0
+_TIME_MATCH_TOLERANCE_HOURS: float = 1e-6
 
 
 def initialise_zarr(zarr_path: str, config: dict) -> xr.Dataset:
@@ -63,8 +70,13 @@ def _build_var_matcher(config: dict) -> list:
     """Build a list of variable matchers from a parsed config.
 
     Each entry is a tuple ``(var_name, grib2_keys, dims)`` where *grib2_keys*
-    is a dict of the GRIB2 identification keys for that variable and *dims* is
-    the list of dimension reference dicts as written in the config.
+    is a dict of the combined GRIB2 identification keys for that variable —
+    its own discipline/parameterCategory/parameterNumber keys **plus** any
+    ``grib2`` keys declared on its dimension references (e.g.
+    ``typeOfFirstFixedSurface`` from the vertical coordinate).  Including the
+    vertical-coordinate keys ensures that two variables sharing the same
+    parameter numbers but placed on different level types (e.g. hybrid-sigma
+    vs. height-above-ground) are matched uniquely.
 
     Parameters
     ----------
@@ -80,6 +92,13 @@ def _build_var_matcher(config: dict) -> list:
         var_name = var["name"]
         grib2_keys = dict(var.get("grib2", {}))
         dims = var.get("dims", [])
+        # Merge grib2 keys from dimension references so that level-type keys
+        # (e.g. typeOfFirstFixedSurface) become part of the variable match.
+        for dim_ref in dims:
+            if isinstance(dim_ref, dict):
+                dim_grib2 = dim_ref.get("grib2", {})
+                if dim_grib2:
+                    grib2_keys.update(dim_grib2)
         matchers.append((var_name, grib2_keys, dims))
     return matchers
 
@@ -126,19 +145,79 @@ def _find_level_index(level: int, msg_keys: dict, dims: list):
     return None
 
 
-async def read_grib(grib_file_path: str, matchers: list):
+def _find_time_index(msg_keys: dict, dims: list):
+    """Return the time-dimension index for the current GRIB2 message.
+
+    Searches *dims* for a dimension that carries a ``reference_time`` field
+    (marking it as the time/forecast-period axis).  The validity datetime of
+    the message is reconstructed from the ``validityDate`` (YYYYMMDD integer)
+    and ``validityTime`` (HHMM integer) keys in *msg_keys* and compared
+    against the configured step offsets (hours from ``reference_time``).
+
+    When no dimension with ``reference_time`` is found the function returns
+    ``0`` so that single-time-step configurations continue to work without
+    modification.
+
+    Parameters
+    ----------
+    msg_keys:
+        Dict of GRIB key/value pairs already fetched from the current message.
+    dims:
+        List of dimension reference dicts from the variable configuration.
+
+    Returns
+    -------
+    int or None
+        Zero-based index into the time coordinate array, ``0`` when no
+        datetime-based time dimension is configured, or ``None`` when the
+        message validity time falls outside the configured step range.
+    """
+    for dim_ref in dims:
+        if not isinstance(dim_ref, dict):
+            continue
+        ref_time_str = dim_ref.get("reference_time")
+        if ref_time_str is None:
+            continue
+        # This dimension is the datetime-based time axis.
+        validity_date = msg_keys.get("validityDate")
+        validity_time = msg_keys.get("validityTime")
+        if validity_date is None or validity_time is None:
+            return None
+        ref_dt = datetime.fromisoformat(ref_time_str)
+        valid_dt = datetime(
+            validity_date // 10000,
+            (validity_date % 10000) // 100,
+            validity_date % 100,
+            validity_time // 100,
+            validity_time % 100,
+        )
+        delta_hours = (valid_dt - ref_dt).total_seconds() / _SECONDS_PER_HOUR
+        step_values = _eval_values(dim_ref.get("values", []))
+        for idx, sv in enumerate(step_values):
+            if abs(float(sv) - delta_hours) < _TIME_MATCH_TOLERANCE_HOURS:
+                return idx
+        # Validity time is outside the configured step range → skip message
+        return None
+    # No datetime-based time dimension: single-time-step fallback
+    return 0
+
+
+async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
     """Async generator yielding matched GRIB messages.
 
     Each yielded item is a tuple::
 
         (var_name, t_idx, z_idx, values)
 
-    where *t_idx* is always 0 (single time-step assumption), *z_idx* is the
-    zero-based index into the variable's vertical coordinate, and *values* is
-    the flat numpy array of grid values.
+    where *t_idx* is the zero-based index into the time coordinate (derived
+    from the message's ``validityDate``/``validityTime`` keys when the time
+    dimension carries a ``reference_time``, or ``0`` for single-step configs),
+    *z_idx* is the zero-based index into the variable's vertical coordinate,
+    and *values* is the flat numpy array of grid values.
 
     Only messages that match at least one variable in *matchers* **and**
-    whose level value falls within the configured coordinate range are yielded.
+    whose level **and** validity time fall within the configured coordinate
+    ranges are yielded.
 
     GRIB key names used for matching are derived dynamically from the config:
     all keys present in each variable's ``grib2`` dict are checked, so adding
@@ -147,59 +226,76 @@ async def read_grib(grib_file_path: str, matchers: list):
 
     Parameters
     ----------
-    grib_file_path:
-        Path to the GRIB2 file to read.
+    grib_file_paths:
+        Path (or list of paths) to the GRIB2 file(s) to read.  When a list
+        is supplied all files are processed in order as if they were
+        concatenated.
     matchers:
         List produced by :func:`_build_var_matcher`.
     """
+    if isinstance(grib_file_paths, str):
+        grib_file_paths = [grib_file_paths]
+
     # Pre-compute the union of all GRIB key names that need to be fetched.
     # This covers both variable-identification keys (from each variable's
     # grib2 dict) and dimension-identification keys (from each dim's grib2
     # dict), so a single pass per message is sufficient.
-    keys_needed: set = set()
+    # validityDate and validityTime are always fetched to support
+    # datetime-based time-index matching.
+    keys_needed: set = {"validityDate", "validityTime"}
     for _var_name, grib2_keys, dims in matchers:
         keys_needed.update(grib2_keys.keys())
         for dim_ref in dims:
             if isinstance(dim_ref, dict):
                 keys_needed.update(dim_ref.get("grib2", {}).keys())
 
-    with open(grib_file_path, "rb") as f:
-        while True:
-            gid = codes_grib_new_from_file(f)
-            if gid is None:
-                break
-
-            level = codes_get(gid, "level")
-
-            # Fetch all keys required for matching in one pass
-            msg_keys: dict = {}
-            for key in keys_needed:
-                try:
-                    msg_keys[key] = codes_get(gid, key)
-                except Exception:
-                    pass  # Key absent in this message type
-
-            matched = None
-            for var_name, grib2_keys, dims in matchers:
-                if all(msg_keys.get(k) == v for k, v in grib2_keys.items()):
-                    matched = (var_name, dims)
+    for grib_file_path in grib_file_paths:
+        with open(grib_file_path, "rb") as f:
+            while True:
+                gid = codes_grib_new_from_file(f)
+                if gid is None:
                     break
 
-            if matched is not None:
-                var_name, dims = matched
-                z_idx = _find_level_index(level, msg_keys, dims)
-                if z_idx is not None:
-                    values = codes_get_values(gid)
-                    codes_release(gid)
-                    yield (var_name, 0, z_idx, values)
+                level = codes_get(gid, "level", ktype=int)
+
+                # Fetch all keys required for matching in one pass.
+                # Request values as ``int`` (ktype=int) so that coded keys such as
+                # ``typeOfFirstFixedSurface`` are always returned as integers
+                # (e.g. 105) rather than string abbreviations (e.g. 'ml').
+                # This ensures the values match the integer constants declared in
+                # the config YAML.
+                msg_keys: dict = {}
+                for key in keys_needed:
+                    try:
+                        msg_keys[key] = codes_get(gid, key, ktype=int)
+                    except Exception:
+                        try:
+                            msg_keys[key] = codes_get(gid, key)
+                        except Exception:
+                            pass  # Key absent in this message type
+
+                matched = None
+                for var_name, grib2_keys, dims in matchers:
+                    if all(msg_keys.get(k) == v for k, v in grib2_keys.items()):
+                        matched = (var_name, dims)
+                        break
+
+                if matched is not None:
+                    var_name, dims = matched
+                    z_idx = _find_level_index(level, msg_keys, dims)
+                    t_idx = _find_time_index(msg_keys, dims)
+                    if z_idx is not None and t_idx is not None:
+                        values = codes_get_values(gid)
+                        codes_release(gid)
+                        yield (var_name, t_idx, z_idx, values)
+                    else:
+                        codes_release(gid)
                 else:
                     codes_release(gid)
-            else:
-                codes_release(gid)
 
-            # Yield control back to the event loop between messages so that
-            # the consumer can make progress while reading is ongoing.
-            await asyncio.sleep(0)
+                # Yield control back to the event loop between messages so that
+                # the consumer can make progress while reading is ongoing.
+                await asyncio.sleep(0)
 
 
 async def write_slice(
@@ -214,8 +310,9 @@ async def write_slice(
 
     The region written is determined by the variable's dimension names stored
     in *ds*.  All spatial dimensions (y, x – the last two dims) are written in
-    full; the ``steps`` and vertical dimensions are written at the indices
-    given by *t_idx* and *z_idx* respectively.
+    full; the time dimension (identified by CF ``axis: T``) and the vertical
+    dimension are written at the indices given by *t_idx* and *z_idx*
+    respectively.
 
     Parameters
     ----------
@@ -224,7 +321,7 @@ async def write_slice(
     var_name:
         Name of the target data variable in *ds*.
     t_idx:
-        Index along the ``steps`` (time) dimension.
+        Index along the time dimension.
     z_idx:
         Index along the vertical dimension.
     values:
@@ -243,38 +340,29 @@ async def write_slice(
     nx = da_var.sizes[dim_names[-1]]
     grid = values.reshape(ny, nx)
 
-    # Build the numpy index tuple and the zarr region dict
+    # Build the numpy index tuple for writing directly into the zarr array.
+    # Integer indices are used for the time and vertical dimensions so that
+    # only the single target slice is overwritten.
     np_idx = []
-    region = {}
     for dim in dim_names:
-        if dim == "steps":
-            np_idx.append(t_idx)
-            region[dim] = slice(t_idx, t_idx + 1)
-        elif dim in spatial_dims:
+        if dim in spatial_dims:
             np_idx.append(slice(None))
-            region[dim] = slice(None)
+        elif dim in ds.coords and ds.coords[dim].attrs.get("axis") == "T":
+            np_idx.append(t_idx)
         else:
-            # Vertical dimension
             np_idx.append(z_idx)
-            region[dim] = slice(z_idx, z_idx + 1)
 
-    # Assign to in-memory array
-    ds[var_name].values[tuple(np_idx)] = grid
-
-    # Write the slice to the Zarr store.
-    # Each GRIB message encodes a single level, so there is at most one
-    # vertical dimension per variable; the dict comprehension is safe here.
-    isel_dict = {
-        d: slice(t_idx, t_idx + 1) if d == "steps" else slice(z_idx, z_idx + 1)
-        for d in dim_names
-        if d not in spatial_dims
-    }
-    ds[[var_name]].isel(isel_dict).to_zarr(zarr_path, mode="r+", region=region)
+    # Write directly to the Zarr store.  The dataset data variables are
+    # backed by lazy dask arrays, so modifying ``ds[var_name].values`` only
+    # updates a temporary computed copy and never persists.  Opening the store
+    # with zarr and indexing directly avoids that problem.
+    store = zarr.open(zarr_path, mode="r+")
+    store[var_name][tuple(np_idx)] = grid
 
 
 async def producer(
     queue: asyncio.Queue,
-    grib_file_path: str,
+    grib_file_paths: Union[str, List[str]],
     matchers: list,
 ) -> None:
     """Read GRIB messages and push them onto *queue*.
@@ -286,12 +374,12 @@ async def producer(
     ----------
     queue:
         Shared asyncio queue.
-    grib_file_path:
-        Path to the GRIB2 file.
+    grib_file_paths:
+        Path (or list of paths) to the GRIB2 file(s).
     matchers:
         List produced by :func:`_build_var_matcher`.
     """
-    async for message in read_grib(grib_file_path, matchers):
+    async for message in read_grib(grib_file_paths, matchers):
         await queue.put(message)
     await queue.put(None)  # Sentinel – no more messages
 
@@ -322,13 +410,13 @@ async def consumer(
         queue.task_done()
 
 
-async def main(grib_file_path: str, zarr_path: str, config_path: str) -> None:
+async def main(grib_file_paths: Union[str, List[str]], zarr_path: str, config_path: str) -> None:
     """Orchestrate the producer/consumer pipeline.
 
     Parameters
     ----------
-    grib_file_path:
-        Path to the GRIB2 file to read.
+    grib_file_paths:
+        Path (or list of paths) to the GRIB2 file(s) to read.
     zarr_path:
         Destination Zarr store path.
     config_path:
@@ -340,30 +428,40 @@ async def main(grib_file_path: str, zarr_path: str, config_path: str) -> None:
     var_names = [m[0] for m in matchers]
 
     queue: asyncio.Queue = asyncio.Queue()
-    producer_task = asyncio.create_task(producer(queue, grib_file_path, matchers))
+    producer_task = asyncio.create_task(producer(queue, grib_file_paths, matchers))
     consumer_task = asyncio.create_task(consumer(queue, ds, zarr_path))
 
     await asyncio.gather(producer_task)
     await queue.join()
     await consumer_task
 
+    if isinstance(grib_file_paths, list):
+        files_str = ", ".join(f"'{p}'" for p in grib_file_paths)
+    else:
+        files_str = f"'{grib_file_paths}'"
     print(
         f"Done. Variables {', '.join(var_names)} written to '{zarr_path}' "
-        f"using config '{config_path}'."
+        f"from {files_str} using config '{config_path}'."
     )
 
 
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "Extract parameters from a GRIB2 file and store them in Zarr."
+            "Extract parameters from one or more GRIB2 files and store them in Zarr."
         )
     )
-    parser.add_argument("grib_file", help="Path to the input GRIB2 file.")
     parser.add_argument(
-        "zarr_path",
-        nargs="?",
+        "grib_files",
+        nargs="+",
+        metavar="GRIB_FILE",
+        help="Path(s) to one or more input GRIB2 files.",
+    )
+    parser.add_argument(
+        "--output",
         default=DEFAULT_ZARR_PATH,
+        metavar="ZARR_PATH",
+        dest="zarr_path",
         help=f"Output Zarr store path (default: {DEFAULT_ZARR_PATH}).",
     )
     parser.add_argument(
@@ -381,5 +479,5 @@ def _parse_args(argv=None):
 
 if __name__ == "__main__":
     args = _parse_args(sys.argv[1:])
-    asyncio.run(main(args.grib_file, args.zarr_path, args.config))
+    asyncio.run(main(args.grib_files, args.zarr_path, args.config))
 

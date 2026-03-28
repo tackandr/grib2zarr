@@ -17,6 +17,8 @@ Usage example::
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import yaml
 import numpy as np
 import xarray as xr
@@ -72,6 +74,26 @@ def _eval_values(values) -> list:
     return list(values)
 
 
+def _build_datetime_values(reference_time: str, step_values: list) -> np.ndarray:
+    """Convert step offsets (hours) to a ``numpy.datetime64`` array.
+
+    Parameters
+    ----------
+    reference_time:
+        ISO 8601 reference datetime string, e.g. ``"2026-03-27T09:00:00"``.
+    step_values:
+        List of step offsets in hours from the reference time.
+
+    Returns
+    -------
+    numpy.ndarray
+        Array of ``numpy.datetime64`` values with nanosecond precision.
+    """
+    ref_dt = datetime.fromisoformat(reference_time)
+    dt_values = [ref_dt + timedelta(hours=float(s)) for s in step_values]
+    return np.array(dt_values, dtype="datetime64[ns]")
+
+
 def build_dataset(config: dict) -> xr.Dataset:
     """Build an empty xarray Dataset from a parsed YAML configuration.
 
@@ -107,8 +129,18 @@ def build_dataset(config: dict) -> xr.Dataset:
     for coord_entry in config.get("coordinates", []):
         for _, info in coord_entry.items():
             name = info["name"]
-            values = np.array(_eval_values(info["values"]))
+            ref_time = info.get("reference_time")
+            if ref_time is not None:
+                step_vals = _eval_values(info["values"])
+                values = _build_datetime_values(ref_time, step_vals)
+            else:
+                values = np.array(_eval_values(info["values"]))
             cf_attrs = dict(info.get("cf", {}))
+            if ref_time is not None:
+                # xarray manages the ``units`` encoding for datetime64 arrays
+                # automatically.  Keeping a user-supplied ``units`` attr would
+                # cause a "Key already exists" conflict during to_zarr encoding.
+                cf_attrs.pop("units", None)
             coords[name] = xr.Variable(name, values, attrs=cf_attrs)
 
             # Auxiliary parameter variables (e.g. a/b for hybrid levels)
