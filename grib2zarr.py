@@ -20,6 +20,7 @@ Example:
 import argparse
 import asyncio
 import sys
+from datetime import datetime
 from typing import List
 
 import xarray as xr
@@ -34,6 +35,10 @@ from config_parser import build_dataset, load_config, _eval_values
 
 # Default output path
 DEFAULT_ZARR_PATH = "myfile.zarr"
+
+# Named constants used in time-index matching
+_SECONDS_PER_HOUR: float = 3600.0
+_TIME_MATCH_TOLERANCE_HOURS: float = 1e-6
 
 
 def initialise_zarr(zarr_path: str, config: dict) -> xr.Dataset:
@@ -126,6 +131,63 @@ def _find_level_index(level: int, msg_keys: dict, dims: list):
     return None
 
 
+def _find_time_index(msg_keys: dict, dims: list):
+    """Return the time-dimension index for the current GRIB2 message.
+
+    Searches *dims* for a dimension that carries a ``reference_time`` field
+    (marking it as the time/forecast-period axis).  The validity datetime of
+    the message is reconstructed from the ``validityDate`` (YYYYMMDD integer)
+    and ``validityTime`` (HHMM integer) keys in *msg_keys* and compared
+    against the configured step offsets (hours from ``reference_time``).
+
+    When no dimension with ``reference_time`` is found the function returns
+    ``0`` so that single-time-step configurations continue to work without
+    modification.
+
+    Parameters
+    ----------
+    msg_keys:
+        Dict of GRIB key/value pairs already fetched from the current message.
+    dims:
+        List of dimension reference dicts from the variable configuration.
+
+    Returns
+    -------
+    int or None
+        Zero-based index into the time coordinate array, ``0`` when no
+        datetime-based time dimension is configured, or ``None`` when the
+        message validity time falls outside the configured step range.
+    """
+    for dim_ref in dims:
+        if not isinstance(dim_ref, dict):
+            continue
+        ref_time_str = dim_ref.get("reference_time")
+        if ref_time_str is None:
+            continue
+        # This dimension is the datetime-based time axis.
+        validity_date = msg_keys.get("validityDate")
+        validity_time = msg_keys.get("validityTime")
+        if validity_date is None or validity_time is None:
+            return None
+        ref_dt = datetime.fromisoformat(ref_time_str)
+        valid_dt = datetime(
+            validity_date // 10000,
+            (validity_date % 10000) // 100,
+            validity_date % 100,
+            validity_time // 100,
+            validity_time % 100,
+        )
+        delta_hours = (valid_dt - ref_dt).total_seconds() / _SECONDS_PER_HOUR
+        step_values = _eval_values(dim_ref.get("values", []))
+        for idx, sv in enumerate(step_values):
+            if abs(float(sv) - delta_hours) < _TIME_MATCH_TOLERANCE_HOURS:
+                return idx
+        # Validity time is outside the configured step range → skip message
+        return None
+    # No datetime-based time dimension: single-time-step fallback
+    return 0
+
+
 async def read_grib(grib_file_path: str, matchers: list):
     """Async generator yielding matched GRIB messages.
 
@@ -133,12 +195,15 @@ async def read_grib(grib_file_path: str, matchers: list):
 
         (var_name, t_idx, z_idx, values)
 
-    where *t_idx* is always 0 (single time-step assumption), *z_idx* is the
-    zero-based index into the variable's vertical coordinate, and *values* is
-    the flat numpy array of grid values.
+    where *t_idx* is the zero-based index into the time coordinate (derived
+    from the message's ``validityDate``/``validityTime`` keys when the time
+    dimension carries a ``reference_time``, or ``0`` for single-step configs),
+    *z_idx* is the zero-based index into the variable's vertical coordinate,
+    and *values* is the flat numpy array of grid values.
 
     Only messages that match at least one variable in *matchers* **and**
-    whose level value falls within the configured coordinate range are yielded.
+    whose level **and** validity time fall within the configured coordinate
+    ranges are yielded.
 
     GRIB key names used for matching are derived dynamically from the config:
     all keys present in each variable's ``grib2`` dict are checked, so adding
@@ -156,7 +221,9 @@ async def read_grib(grib_file_path: str, matchers: list):
     # This covers both variable-identification keys (from each variable's
     # grib2 dict) and dimension-identification keys (from each dim's grib2
     # dict), so a single pass per message is sufficient.
-    keys_needed: set = set()
+    # validityDate and validityTime are always fetched to support
+    # datetime-based time-index matching.
+    keys_needed: set = {"validityDate", "validityTime"}
     for _var_name, grib2_keys, dims in matchers:
         keys_needed.update(grib2_keys.keys())
         for dim_ref in dims:
@@ -188,10 +255,11 @@ async def read_grib(grib_file_path: str, matchers: list):
             if matched is not None:
                 var_name, dims = matched
                 z_idx = _find_level_index(level, msg_keys, dims)
-                if z_idx is not None:
+                t_idx = _find_time_index(msg_keys, dims)
+                if z_idx is not None and t_idx is not None:
                     values = codes_get_values(gid)
                     codes_release(gid)
-                    yield (var_name, 0, z_idx, values)
+                    yield (var_name, t_idx, z_idx, values)
                 else:
                     codes_release(gid)
             else:
@@ -214,8 +282,9 @@ async def write_slice(
 
     The region written is determined by the variable's dimension names stored
     in *ds*.  All spatial dimensions (y, x – the last two dims) are written in
-    full; the ``steps`` and vertical dimensions are written at the indices
-    given by *t_idx* and *z_idx* respectively.
+    full; the time dimension (identified by CF ``axis: T``) and the vertical
+    dimension are written at the indices given by *t_idx* and *z_idx*
+    respectively.
 
     Parameters
     ----------
@@ -224,7 +293,7 @@ async def write_slice(
     var_name:
         Name of the target data variable in *ds*.
     t_idx:
-        Index along the ``steps`` (time) dimension.
+        Index along the time dimension.
     z_idx:
         Index along the vertical dimension.
     values:
@@ -247,12 +316,13 @@ async def write_slice(
     np_idx = []
     region = {}
     for dim in dim_names:
-        if dim == "steps":
-            np_idx.append(t_idx)
-            region[dim] = slice(t_idx, t_idx + 1)
-        elif dim in spatial_dims:
+        if dim in spatial_dims:
             np_idx.append(slice(None))
             region[dim] = slice(None)
+        elif dim in ds.coords and ds.coords[dim].attrs.get("axis") == "T":
+            # Time dimension – identified by CF axis attribute
+            np_idx.append(t_idx)
+            region[dim] = slice(t_idx, t_idx + 1)
         else:
             # Vertical dimension
             np_idx.append(z_idx)
@@ -262,13 +332,14 @@ async def write_slice(
     ds[var_name].values[tuple(np_idx)] = grid
 
     # Write the slice to the Zarr store.
-    # Each GRIB message encodes a single level, so there is at most one
-    # vertical dimension per variable; the dict comprehension is safe here.
-    isel_dict = {
-        d: slice(t_idx, t_idx + 1) if d == "steps" else slice(z_idx, z_idx + 1)
-        for d in dim_names
-        if d not in spatial_dims
-    }
+    isel_dict = {}
+    for d in dim_names:
+        if d in spatial_dims:
+            continue
+        if d in ds.coords and ds.coords[d].attrs.get("axis") == "T":
+            isel_dict[d] = slice(t_idx, t_idx + 1)
+        else:
+            isel_dict[d] = slice(z_idx, z_idx + 1)
     ds[[var_name]].isel(isel_dict).to_zarr(zarr_path, mode="r+", region=region)
 
 

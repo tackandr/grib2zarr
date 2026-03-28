@@ -82,10 +82,11 @@ coordinates:
 
   - steps: &steps
       name: steps
+      reference_time: "2026-03-27T09:00:00"
       cf:
         axis: T
-        standard_name: forecast_period
-        units: hours
+        standard_name: time
+        units: hours since 2026-03-27 09:00:00
       values: '[i for i in range(1, 49)]'
       chunk: 1
 
