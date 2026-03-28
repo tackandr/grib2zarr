@@ -84,46 +84,46 @@ def _build_var_matcher(config: dict) -> list:
     return matchers
 
 
-def _find_level_index(level: int, type_of_first_fixed_surface: int, dims: list) -> int:
+def _find_level_index(level: int, msg_keys: dict, dims: list):
     """Return the index of *level* within the matching vertical coordinate.
 
-    Searches *dims* for a dimension whose ``grib2.typeOfFirstFixedSurface``
-    matches *type_of_first_fixed_surface*, then looks up *level* in that
-    dimension's value list.
+    Searches *dims* for a dimension whose ``grib2`` keys all match the
+    corresponding values in *msg_keys*, then looks up *level* in that
+    dimension's configured coordinate values.
 
-    If the level value is found in the list the list-position index is
-    returned.  Otherwise, for 1-based level numbering (typical for hybrid
-    levels), ``level - 1`` is used as a fallback.  Returns 0 when no
-    matching dimension is found.
+    Returns the zero-based list index when the level is found in the
+    configured coordinate values, or ``None`` if no dimension matches or
+    the level value falls outside the configured coordinate range.
 
     Parameters
     ----------
     level:
         GRIB ``level`` key value for the current message.
-    type_of_first_fixed_surface:
-        GRIB ``typeOfFirstFixedSurface`` key value for the current message.
+    msg_keys:
+        Dict of GRIB key/value pairs already fetched from the current message.
     dims:
         List of dimension reference dicts from the variable configuration.
 
     Returns
     -------
-    int
-        Zero-based level index into the vertical coordinate array.
+    int or None
+        Zero-based index into the coordinate array, or ``None`` if the
+        level is not present in the configured coordinate values.
     """
     for dim_ref in dims:
         if not isinstance(dim_ref, dict):
             continue
         grib2 = dim_ref.get("grib2", {})
-        if grib2.get("typeOfFirstFixedSurface") == type_of_first_fixed_surface:
-            values = _eval_values(dim_ref.get("values", []))
-            if level in values:
-                # Exact match: return the list position
-                return values.index(level)
-            # Fallback for 1-based level numbering (e.g. hybrid levels
-            # numbered 1..N): only applied when `level` was not found above
-            if 1 <= level <= len(values):
-                return level - 1
-    return 0
+        if not grib2:
+            continue
+        # All grib2 keys declared for this dim must match the current message
+        if all(msg_keys.get(k) == v for k, v in grib2.items()):
+            coord_values = _eval_values(dim_ref.get("values", []))
+            if level in coord_values:
+                return coord_values.index(level)
+            # Level is outside the configured coordinate range → skip message
+            return None
+    return None
 
 
 async def read_grib(grib_file_path: str, matchers: list):
@@ -137,7 +137,13 @@ async def read_grib(grib_file_path: str, matchers: list):
     zero-based index into the variable's vertical coordinate, and *values* is
     the flat numpy array of grid values.
 
-    Only messages that match at least one variable in *matchers* are yielded.
+    Only messages that match at least one variable in *matchers* **and**
+    whose level value falls within the configured coordinate range are yielded.
+
+    GRIB key names used for matching are derived dynamically from the config:
+    all keys present in each variable's ``grib2`` dict are checked, so adding
+    extra identification keys (e.g. ``typeOfStatisticalProcessing``) to the
+    config automatically takes effect without code changes.
 
     Parameters
     ----------
@@ -146,34 +152,48 @@ async def read_grib(grib_file_path: str, matchers: list):
     matchers:
         List produced by :func:`_build_var_matcher`.
     """
+    # Pre-compute the union of all GRIB key names that need to be fetched.
+    # This covers both variable-identification keys (from each variable's
+    # grib2 dict) and dimension-identification keys (from each dim's grib2
+    # dict), so a single pass per message is sufficient.
+    keys_needed: set = set()
+    for _var_name, grib2_keys, dims in matchers:
+        keys_needed.update(grib2_keys.keys())
+        for dim_ref in dims:
+            if isinstance(dim_ref, dict):
+                keys_needed.update(dim_ref.get("grib2", {}).keys())
+
     with open(grib_file_path, "rb") as f:
         while True:
             gid = codes_grib_new_from_file(f)
             if gid is None:
                 break
 
-            discipline = codes_get(gid, "discipline")
-            param_category = codes_get(gid, "parameterCategory")
-            param_number = codes_get(gid, "parameterNumber")
-            tofss = codes_get(gid, "typeOfFirstFixedSurface")
             level = codes_get(gid, "level")
+
+            # Fetch all keys required for matching in one pass
+            msg_keys: dict = {}
+            for key in keys_needed:
+                try:
+                    msg_keys[key] = codes_get(gid, key)
+                except Exception:
+                    pass  # Key absent in this message type
 
             matched = None
             for var_name, grib2_keys, dims in matchers:
-                if (
-                    discipline == grib2_keys.get("discipline")
-                    and param_category == grib2_keys.get("parameterCategory")
-                    and param_number == grib2_keys.get("parameterNumber")
-                ):
+                if all(msg_keys.get(k) == v for k, v in grib2_keys.items()):
                     matched = (var_name, dims)
                     break
 
             if matched is not None:
                 var_name, dims = matched
-                values = codes_get_values(gid)
-                z_idx = _find_level_index(level, tofss, dims)
-                codes_release(gid)
-                yield (var_name, 0, z_idx, values)
+                z_idx = _find_level_index(level, msg_keys, dims)
+                if z_idx is not None:
+                    values = codes_get_values(gid)
+                    codes_release(gid)
+                    yield (var_name, 0, z_idx, values)
+                else:
+                    codes_release(gid)
             else:
                 codes_release(gid)
 
