@@ -54,6 +54,7 @@ Via the ``grib2zarr`` CLI::
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import os
 import shutil
 import tempfile
@@ -75,6 +76,7 @@ def rechunk_zarr(
     spatial_chunk: int = 100,
     tmp_path: Optional[str] = None,
     cleanup_tmp: bool = True,
+    workers: int = 1,
 ) -> None:
     """Rechunk a 4-D Zarr array via a two-pass algorithm using a temporary store.
 
@@ -105,6 +107,11 @@ def rechunk_zarr(
     cleanup_tmp:
         When ``True`` (default) the temporary store is deleted after Pass 2
         completes.  Set to ``False`` to keep it for debugging.
+    workers:
+        Number of parallel worker processes used to rechunk variables.  Each
+        variable is rechunked independently, so up to ``len(variables)``
+        workers can be kept busy simultaneously.  Defaults to ``1``
+        (sequential, no child processes spawned).
     """
     src_group = zarr.open_group(src_path, mode="r", zarr_format=2)
     dst_group = zarr.open_group(dst_path, mode="w", zarr_format=2)
@@ -118,28 +125,28 @@ def rechunk_zarr(
             prefix="rechunk_tmp_", dir=os.path.dirname(os.path.abspath(dst_path))
         )
         tmp_path = tmp_dir
-    tmp_group = zarr.open_group(tmp_path, mode="w", zarr_format=2)
+    # Initialise the shared temporary store so workers can open it in append mode.
+    zarr.open_group(tmp_path, mode="w", zarr_format=2)
+
+    array_names = [name for name, _ in src_group.arrays()]
+    task_args = [
+        (name, src_path, tmp_path, dst_path, t_chunk, c_chunk, spatial_chunk, cleanup_tmp)
+        for name in array_names
+    ]
 
     try:
-        for name, src in src_group.arrays():
-            if src.ndim != 4:
-                # Copy coordinate and auxiliary arrays (e.g. time, level, y, x)
-                # verbatim – same chunks, same compressor, same attributes.
-                _copy_array(name=name, src=src, dst_group=dst_group)
-                continue
-            _rechunk_array(
-                name=name,
-                src=src,
-                tmp_group=tmp_group,
-                dst_group=dst_group,
-                t_chunk=t_chunk,
-                c_chunk=c_chunk,
-                spatial_chunk=spatial_chunk,
+        if workers == 1:
+            _log.info("rechunk  variables=%d", len(array_names))
+            for args in task_args:
+                done = _rechunk_variable_worker(args)
+                _log.info("rechunk  finished '%s'", done)
+        else:
+            _log.info(
+                "rechunk  workers=%d  variables=%d", workers, len(array_names)
             )
-            # Delete this variable's temp data as soon as Pass 2 is done so
-            # that disk space is freed incrementally rather than only at the end.
-            if cleanup_tmp and name in tmp_group:
-                del tmp_group[name]
+            with multiprocessing.Pool(processes=workers) as pool:
+                for done in pool.map(_rechunk_variable_worker, task_args):
+                    _log.info("rechunk  finished '%s'", done)
     finally:
         if cleanup_tmp and _own_tmp:
             shutil.rmtree(tmp_path, ignore_errors=True)
@@ -292,3 +299,62 @@ def _rechunk_array(
         t_pass2,
         t_pass1 + t_pass2,
     )
+
+
+def _rechunk_variable_worker(task_args: tuple) -> str:
+    """Rechunk (or copy) a single variable; suitable for use with :class:`multiprocessing.Pool`.
+
+    This is a module-level function so that it can be pickled by
+    :mod:`multiprocessing`.  It opens the source, temporary and destination
+    Zarr stores by path (zarr objects are **not** passed across process
+    boundaries).
+
+    Parameters
+    ----------
+    task_args:
+        An 8-tuple of
+        ``(name, src_path, tmp_path, dst_path, t_chunk, c_chunk,
+        spatial_chunk, cleanup_tmp)``.
+
+    Returns
+    -------
+    str
+        The variable *name* that was processed (useful for progress tracking).
+    """
+    (
+        name,
+        src_path,
+        tmp_path,
+        dst_path,
+        t_chunk,
+        c_chunk,
+        spatial_chunk,
+        cleanup_tmp,
+    ) = task_args
+
+    src_group = zarr.open_group(src_path, mode="r", zarr_format=2)
+    src = src_group[name]
+    dst_group = zarr.open_group(dst_path, mode="a", zarr_format=2)
+
+    if src.ndim != 4:
+        # Copy coordinate and auxiliary arrays (e.g. time, level, y, x)
+        # verbatim – same chunks, same compressor, same attributes.
+        _copy_array(name=name, src=src, dst_group=dst_group)
+        return name
+
+    tmp_group = zarr.open_group(tmp_path, mode="a", zarr_format=2)
+    _rechunk_array(
+        name=name,
+        src=src,
+        tmp_group=tmp_group,
+        dst_group=dst_group,
+        t_chunk=t_chunk,
+        c_chunk=c_chunk,
+        spatial_chunk=spatial_chunk,
+    )
+    # Delete this variable's temp data as soon as Pass 2 is done so
+    # that disk space is freed incrementally rather than only at the end.
+    if cleanup_tmp and name in tmp_group:
+        del tmp_group[name]
+
+    return name
