@@ -58,7 +58,6 @@ import multiprocessing
 import os
 import tempfile
 import time
-import uuid
 import warnings
 from typing import Optional
 
@@ -124,15 +123,16 @@ def rechunk_zarr(
     _own_tmp = tmp_path is None
     if _own_tmp:
         if dst_path.startswith("s3://"):
-            # For S3 destinations, create the temp store on S3 alongside the
-            # destination path.  A short random suffix prevents collisions when
-            # multiple rechunk operations target the same destination.
-            tmp_path = dst_path.rstrip("/") + f"_tmp_{uuid.uuid4().hex[:8]}"
+            # For S3 destinations keep the intermediate temp store on the local
+            # scratch disk.  Writing pass-1 data to S3 one slice at a time would
+            # be extremely slow; local I/O is fast and the data is discarded
+            # after pass 2 completes.
+            tmp_dir = tempfile.mkdtemp(prefix="rechunk_tmp_")
         else:
             tmp_dir = tempfile.mkdtemp(
                 prefix="rechunk_tmp_", dir=os.path.dirname(os.path.abspath(dst_path))
             )
-            tmp_path = tmp_dir
+        tmp_path = tmp_dir
     # Initialise the shared temporary store so workers can open it in append mode.
     zarr.open_group(open_store(tmp_path), mode="w", zarr_format=2)
 
