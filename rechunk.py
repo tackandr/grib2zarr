@@ -109,6 +109,9 @@ def rechunk_zarr(
     src_group = zarr.open_group(src_path, mode="r", zarr_format=2)
     dst_group = zarr.open_group(dst_path, mode="w", zarr_format=2)
 
+    # Copy group-level attributes to the destination.
+    dst_group.attrs.update(dict(src_group.attrs))
+
     _own_tmp = tmp_path is None
     if _own_tmp:
         tmp_dir = tempfile.mkdtemp(
@@ -120,8 +123,9 @@ def rechunk_zarr(
     try:
         for name, src in src_group.arrays():
             if src.ndim != 4:
-                # Skip coordinate and auxiliary arrays (e.g. time, level, y, x).
-                # Only 4-D data variables are rechunked.
+                # Copy coordinate and auxiliary arrays (e.g. time, level, y, x)
+                # verbatim – same chunks, same compressor, same attributes.
+                _copy_array(name=name, src=src, dst_group=dst_group)
                 continue
             _rechunk_array(
                 name=name,
@@ -139,6 +143,31 @@ def rechunk_zarr(
     finally:
         if cleanup_tmp and _own_tmp:
             shutil.rmtree(tmp_path, ignore_errors=True)
+
+    # Write consolidated metadata (.zmetadata) so tools like xarray can read
+    # the store without scanning every array individually.
+    zarr.consolidate_metadata(dst_path)
+
+
+def _copy_array(name: str, src: zarr.Array, dst_group: zarr.Group) -> None:
+    """Copy an array verbatim (data, chunks, compressor, attributes) to *dst_group*.
+
+    Used for coordinate and auxiliary arrays that do not need rechunking.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        src_compressor = src.compressor
+
+    dst = dst_group.create_array(
+        name,
+        shape=src.shape,
+        chunks=src.chunks,
+        dtype=src.dtype,
+        compressors=src_compressor,
+        overwrite=True,
+    )
+    dst[:] = src[:]
+    dst.attrs.update(dict(src.attrs))
 
 
 def _rechunk_array(
@@ -215,6 +244,8 @@ def _rechunk_array(
         compressors=src_compressor,
         overwrite=True,
     )
+    # Preserve the source array's attributes in the rechunked output.
+    dst.attrs.update(dict(src.attrs))
 
     # ------------------------------------------------------------------
     # Pass 1: merge the time axis into t_chunk blocks; keep C = 1.
