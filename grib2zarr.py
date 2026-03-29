@@ -37,6 +37,7 @@ from eccodes import (
 
 from config_parser import build_dataset, load_config, _eval_values
 from rechunk import rechunk_zarr
+from s3_store import open_store
 
 # Default output path
 DEFAULT_ZARR_PATH = "myfile.zarr"
@@ -67,7 +68,7 @@ def initialise_zarr(zarr_path: str, config: dict) -> xr.Dataset:
         The in-memory dataset whose Zarr store was just initialised.
     """
     ds = build_dataset(config)
-    ds.to_zarr(zarr_path, mode="w", zarr_format=2, compute=False)
+    ds.to_zarr(open_store(zarr_path), mode="w", zarr_format=2, compute=False)
     return ds
 
 
@@ -372,7 +373,7 @@ async def write_slice(
     # backed by lazy dask arrays, so modifying ``ds[var_name].values`` only
     # updates a temporary computed copy and never persists.  Opening the store
     # with zarr and indexing directly avoids that problem.
-    store = zarr.open(zarr_path, mode="r+")
+    store = zarr.open(open_store(zarr_path), mode="r+")
     store[var_name][tuple(np_idx)] = grid
 
 
