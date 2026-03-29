@@ -53,14 +53,18 @@ Via the ``grib2zarr`` CLI::
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
+import time
 import warnings
 from typing import Optional
 
 import numpy as np
 import zarr
+
+_log = logging.getLogger(__name__)
 
 
 def rechunk_zarr(
@@ -128,6 +132,10 @@ def rechunk_zarr(
                 c_chunk=c_chunk,
                 spatial_chunk=spatial_chunk,
             )
+            # Delete this variable's temp data as soon as Pass 2 is done so
+            # that disk space is freed incrementally rather than only at the end.
+            if cleanup_tmp and name in tmp_group:
+                del tmp_group[name]
     finally:
         if cleanup_tmp and _own_tmp:
             shutil.rmtree(tmp_path, ignore_errors=True)
@@ -212,6 +220,14 @@ def _rechunk_array(
     # Pass 1: merge the time axis into t_chunk blocks; keep C = 1.
     # Each buffer is (min(t_chunk, T), 1, Y, X) – one level at a time.
     # ------------------------------------------------------------------
+    _log.info(
+        "rechunk '%s'  shape=%s  src_chunks=%s  dst_chunks=%s",
+        name,
+        src.shape,
+        src.chunks,
+        dst.chunks,
+    )
+    t_pass1_start = time.perf_counter()
     for t0 in range(0, T, t_chunk):
         t1 = min(t0 + t_chunk, T)
         tlen = t1 - t0
@@ -220,11 +236,13 @@ def _rechunk_array(
             for k, t in enumerate(range(t0, t1)):
                 buf[k, 0, :, :] = src[t, c, :, :]
             tmp[t0:t1, c : c + 1, :, :] = buf
+    t_pass1 = time.perf_counter() - t_pass1_start
 
     # ------------------------------------------------------------------
     # Pass 2: merge the vertical axis; keep spatial tiles.
     # Each buffer is (min(t_chunk, T), C, spatial_chunk, spatial_chunk).
     # ------------------------------------------------------------------
+    t_pass2_start = time.perf_counter()
     for t0 in range(0, T, t_chunk):
         t1 = min(t0 + t_chunk, T)
         for y0 in range(0, Y, spatial_chunk):
@@ -233,3 +251,12 @@ def _rechunk_array(
                 x1 = min(x0 + spatial_chunk, X)
                 buf = tmp[t0:t1, :, y0:y1, x0:x1]
                 dst[t0:t1, :, y0:y1, x0:x1] = buf
+    t_pass2 = time.perf_counter() - t_pass2_start
+
+    _log.info(
+        "rechunk '%s'  pass1=%.1fs  pass2=%.1fs  total=%.1fs",
+        name,
+        t_pass1,
+        t_pass2,
+        t_pass1 + t_pass2,
+    )
