@@ -39,10 +39,6 @@ def _get_s3_storage_options() -> dict:
         options["secret"] = secret
     if endpoint_url:
         options["endpoint_url"] = endpoint_url
-    options["config_kwargs"] = {
-        "request_checksum_calculation": "WHEN_REQUIRED",
-        "response_checksum_validation": "WHEN_REQUIRED",
-    }
     return options
 
 
@@ -88,7 +84,6 @@ def delete_store(path: str) -> None:
             key=options.get("key"),
             secret=options.get("secret"),
             endpoint_url=options.get("endpoint_url"),
-            config_kwargs=options.get("config_kwargs"),
         )
         if fs.exists(path):
             fs.rm(path, recursive=True)
