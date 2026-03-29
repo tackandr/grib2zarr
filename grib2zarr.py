@@ -24,7 +24,7 @@ import logging
 import sys
 import time
 from datetime import datetime
-from typing import List, Optional, Union
+from typing import List, Union
 
 import xarray as xr
 import zarr
@@ -36,7 +36,6 @@ from eccodes import (
 )
 
 from config_parser import build_dataset, load_config, _eval_values
-from rechunk import rechunk_zarr
 from s3_store import open_store
 
 # Default output path
@@ -431,9 +430,6 @@ async def main(
     grib_file_paths: Union[str, List[str]],
     zarr_path: str,
     config_path: str,
-    rechunk_path: Optional[str] = None,
-    cleanup_tmp: bool = True,
-    workers: int = 1,
 ) -> None:
     """Orchestrate the producer/consumer pipeline.
 
@@ -445,21 +441,6 @@ async def main(
         Destination Zarr store path.
     config_path:
         Path to the YAML configuration file describing the target dataset.
-    rechunk_path:
-        When provided, the data written to *zarr_path* is rechunked into a
-        new Zarr store at this path using :func:`rechunk.rechunk_zarr` as a
-        finalizing action.  A temporary intermediate store is created
-        automatically and removed after rechunking completes (unless
-        *cleanup_tmp* is ``False``).
-    cleanup_tmp:
-        When ``True`` (default) the intermediate temporary store created
-        during rechunking is deleted automatically.  Set to ``False`` to
-        keep it for debugging.  Has no effect when *rechunk_path* is ``None``.
-    workers:
-        Number of parallel worker processes used during rechunking.  Each
-        variable is rechunked independently, so performance scales with the
-        number of variables up to this limit.  Defaults to ``1`` (sequential).
-        Has no effect when *rechunk_path* is ``None``.
     """
     config = load_config(config_path)
     ds = initialise_zarr(zarr_path, config)
@@ -494,13 +475,6 @@ async def main(
         zarr_path,
     )
 
-    if rechunk_path is not None:
-        _log.info(
-            "rechunk  src='%s'  dst='%s'  workers=%d", zarr_path, rechunk_path, workers
-        )
-        rechunk_zarr(src_path=zarr_path, dst_path=rechunk_path, cleanup_tmp=cleanup_tmp, workers=workers)
-        _log.info("rechunk  done  output='%s'", rechunk_path)
-
 
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
@@ -532,47 +506,11 @@ def _parse_args(argv=None):
         ),
     )
     parser.add_argument(
-        "--rechunk",
-        default=None,
-        metavar="RECHUNK_PATH",
-        dest="rechunk_path",
-        help=(
-            "When specified, rechunk the output Zarr store into a new store at "
-            "this path using a two-pass algorithm.  A temporary intermediate "
-            "store is created automatically and removed on completion."
-        ),
-    )
-    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
         default=False,
-        help="Enable INFO-level logging (shows rechunk timing, progress, etc.).",
-    )
-    parser.add_argument(
-        "--no-cleanup",
-        action="store_true",
-        default=False,
-        dest="no_cleanup",
-        help=(
-            "When specified, keep the intermediate temporary Zarr store that is "
-            "created during rechunking instead of deleting it automatically.  "
-            "Useful for debugging.  Has no effect when --rechunk is not used."
-        ),
-    )
-    parser.add_argument(
-        "-j",
-        "--jobs",
-        type=int,
-        default=1,
-        metavar="N",
-        dest="workers",
-        help=(
-            "Number of parallel worker processes to use for rechunking "
-            "(default: 1).  Each variable is rechunked independently so "
-            "performance scales with the number of variables up to this limit.  "
-            "Has no effect when --rechunk is not used."
-        ),
+        help="Enable INFO-level logging (shows progress, timing, etc.).",
     )
     return parser.parse_args(argv)
 
@@ -586,7 +524,7 @@ def cli() -> None:
             format="%(asctime)s %(levelname)s %(message)s",
             datefmt="%H:%M:%S",
         )
-    asyncio.run(main(args.grib_files, args.zarr_path, args.config, args.rechunk_path, not args.no_cleanup, args.workers))
+    asyncio.run(main(args.grib_files, args.zarr_path, args.config))
 
 
 if __name__ == "__main__":

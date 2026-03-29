@@ -7,7 +7,7 @@ Extract parameters from a GRIB2 file and store them in a [Zarr](https://zarr.dev
 - Reads GRIB2 messages with [eccodes](https://github.com/ecmwf/eccodes-python)
 - Extracts a user-specified list of parameters and stores each as a variable in a Zarr v2 store via [xarray](https://xarray.dev/)
 - Uses an `asyncio` producer/consumer queue to decouple I/O-bound reading from writing
-- Optional **two-pass rechunking** (`--rechunk`) that restructures the output store into a layout optimised for time-series access without requiring the full dataset to fit in RAM
+- Separate **`rechunk2zarr`** CLI for optional two-pass rechunking that restructures a Zarr store into a layout optimised for time-series access without requiring the full dataset to fit in RAM
 - Consolidated Zarr metadata (`.zmetadata`) written automatically so tools like xarray open the store without scanning every directory
 - `--verbose` / `-v` flag for INFO-level progress and timing logs
 
@@ -27,7 +27,7 @@ python3 -m venv venv && source venv/bin/activate
 pip install -e .
 ```
 
-After installation a `grib2zarr` command is available on your `PATH`.
+After installation a `grib2zarr` command and a `rechunk2zarr` command are available on your `PATH`.
 
 ## Container (Podman / Docker)
 
@@ -51,8 +51,10 @@ podman run --rm \
 
 ## Usage
 
+### grib2zarr
+
 ```bash
-grib2zarr GRIB_FILE [GRIB_FILE ...] --config CONFIG [--output ZARR_PATH] [--rechunk RECHUNK_PATH] [-v]
+grib2zarr GRIB_FILE [GRIB_FILE ...] --config CONFIG [--output ZARR_PATH] [-v]
 ```
 
 | Argument        | Description                                                                                      | Default       |
@@ -60,8 +62,7 @@ grib2zarr GRIB_FILE [GRIB_FILE ...] --config CONFIG [--output ZARR_PATH] [--rech
 | `GRIB_FILE`     | Path(s) to one or more input GRIB2 files (required)                                              | —             |
 | `--config`      | Path to the YAML configuration file (required)                                                   | —             |
 | `--output`      | Destination Zarr store path                                                                      | `myfile.zarr` |
-| `--rechunk`     | When given, rechunk the output Zarr store into a new store at this path (see [Rechunking](#rechunking)) | —      |
-| `-v`/`--verbose`| Enable INFO-level logging (rechunk timings, progress, etc.)                                      | off           |
+| `-v`/`--verbose`| Enable INFO-level logging (progress, timing, etc.)                                               | off           |
 
 ### Example
 
@@ -70,21 +71,36 @@ grib2zarr fc2026032709+001grib2_mbr000 fc2026032709+002grib2_mbr000 \
     --config config.yaml --output myfile.zarr
 ```
 
-### Example with rechunking and verbose output
+### rechunk2zarr
+
+After extracting to a Zarr store with `grib2zarr`, use `rechunk2zarr` to rechunk it into a layout optimised for time-series access:
 
 ```bash
+rechunk2zarr SRC_PATH DST_PATH [--tmp-path TMP_PATH] [--no-cleanup] [-j N]
+             [--t-chunk T] [--c-chunk C] [--spatial-chunk S] [-v]
+```
+
+| Argument           | Description                                                                                     | Default      |
+|--------------------|-------------------------------------------------------------------------------------------------|--------------|
+| `SRC_PATH`         | Path to the source Zarr store (required)                                                        | —            |
+| `DST_PATH`         | Path for the rechunked output Zarr store (required)                                             | —            |
+| `--tmp-path`       | Path for the intermediate temporary store; auto-generated if not specified                      | auto         |
+| `--no-cleanup`     | Keep the temporary store after rechunking (useful for debugging)                                | off          |
+| `-j`/`--jobs`      | Number of parallel worker processes (each variable is independent)                              | `1`          |
+| `--t-chunk`        | Chunk size along the time axis                                                                  | `24`         |
+| `--c-chunk`        | Chunk size along the vertical axis (defaults to full C dimension)                               | full C       |
+| `--spatial-chunk`  | Chunk size for both spatial axes (Y and X)                                                      | `100`        |
+| `-v`/`--verbose`   | Enable INFO-level logging (per-variable timing, progress, etc.)                                 | off          |
+
+### Example with rechunking
+
+```bash
+# Step 1 – extract GRIB2 files to Zarr
 grib2zarr fc2026032709+001grib2_mbr000 fc2026032709+002grib2_mbr000 \
-    --config config.yaml \
-    --output myfile.zarr \
-    --rechunk myfile_rechunked.zarr \
-    --verbose
-```
+    --config config.yaml --output myfile.zarr
 
-The `--verbose` flag prints per-variable timing lines such as:
-
-```
-13:01:42 INFO rechunk 'temperature'  shape=(67, 66, 1069, 949)  src_chunks=(1, 1, 1069, 949)  dst_chunks=(24, 66, 100, 100)
-13:02:44 INFO rechunk 'temperature'  pass1=42.3s  pass2=20.1s  total=62.4s
+# Step 2 – rechunk the Zarr store
+rechunk2zarr myfile.zarr myfile_rechunked.zarr --verbose
 ```
 
 ## How it works
@@ -97,13 +113,13 @@ The `--verbose` flag prints per-variable timing lines such as:
    skipped cheaply.
 3. **Consumer** – Picks messages off the queue and writes each level slice directly
    into the Zarr store.
-4. **Rechunk (optional)** – After writing, the store is rechunked into a new layout
-   using a memory-efficient two-pass algorithm (see below).
+4. **Rechunk (optional)** – After writing, run `rechunk2zarr` to rechunk the store
+   into a new layout using a memory-efficient two-pass algorithm (see below).
 
 ## Rechunking
 
 The initial Zarr store is written with source-aligned chunks that are optimal for
-fast writing but not for downstream time-series reads.  The `--rechunk` option
+fast writing but not for downstream time-series reads.  The `rechunk2zarr` CLI
 runs a two-pass algorithm that converts the store into a layout with larger time
 blocks and spatial tiles without loading the entire dataset into memory.
 

@@ -45,17 +45,18 @@ As a library::
         cleanup_tmp=True,
     )
 
-Via the ``grib2zarr`` CLI::
+Via the ``rechunk2zarr`` CLI::
 
-    python grib2zarr.py fc*.grib2 --config config.yaml \\
-        --output myfile.zarr --rechunk rechunked.zarr
+    rechunk2zarr myfile.zarr rechunked.zarr --t-chunk 24 --spatial-chunk 100 --verbose
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import multiprocessing
 import os
+import sys
 import tempfile
 import time
 import warnings
@@ -366,3 +367,117 @@ def _rechunk_variable_worker(task_args: tuple) -> str:
         del tmp_group[name]
 
     return name
+
+
+def _parse_rechunk_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description=(
+            "Rechunk a Zarr store written by grib2zarr into a layout optimised "
+            "for time-series access using a memory-efficient two-pass algorithm."
+        )
+    )
+    parser.add_argument(
+        "src_path",
+        metavar="SRC_PATH",
+        help="Path to the source Zarr store to rechunk.",
+    )
+    parser.add_argument(
+        "dst_path",
+        metavar="DST_PATH",
+        help="Path for the rechunked output Zarr store.",
+    )
+    parser.add_argument(
+        "--tmp-path",
+        default=None,
+        metavar="TMP_PATH",
+        dest="tmp_path",
+        help=(
+            "Path for the intermediate temporary Zarr store used between the two "
+            "rechunk passes.  When not specified a temporary directory is created "
+            "automatically inside the parent of DST_PATH (or on the local scratch "
+            "disk for S3 destinations) and removed after rechunking completes."
+        ),
+    )
+    parser.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        default=False,
+        dest="no_cleanup",
+        help=(
+            "Keep the intermediate temporary Zarr store instead of deleting it "
+            "automatically after rechunking completes.  Useful for debugging."
+        ),
+    )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        dest="workers",
+        help=(
+            "Number of parallel worker processes to use for rechunking "
+            "(default: 1).  Each variable is rechunked independently so "
+            "performance scales with the number of variables up to this limit."
+        ),
+    )
+    parser.add_argument(
+        "--t-chunk",
+        type=int,
+        default=24,
+        metavar="T",
+        dest="t_chunk",
+        help="Chunk size along the time axis (default: 24).",
+    )
+    parser.add_argument(
+        "--c-chunk",
+        type=int,
+        default=None,
+        metavar="C",
+        dest="c_chunk",
+        help=(
+            "Chunk size along the vertical axis.  Defaults to the full C "
+            "dimension (one chunk)."
+        ),
+    )
+    parser.add_argument(
+        "--spatial-chunk",
+        type=int,
+        default=100,
+        metavar="S",
+        dest="spatial_chunk",
+        help="Chunk size for both spatial axes (Y and X) (default: 100).",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable INFO-level logging (shows per-variable timing, progress, etc.).",
+    )
+    return parser.parse_args(argv)
+
+
+def cli() -> None:
+    """Console-script entry point installed by ``pip install``."""
+    args = _parse_rechunk_args(sys.argv[1:])
+    if args.verbose:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    rechunk_zarr(
+        src_path=args.src_path,
+        dst_path=args.dst_path,
+        t_chunk=args.t_chunk,
+        c_chunk=args.c_chunk,
+        spatial_chunk=args.spatial_chunk,
+        tmp_path=args.tmp_path,
+        cleanup_tmp=not args.no_cleanup,
+        workers=args.workers,
+    )
+
+
+if __name__ == "__main__":
+    cli()

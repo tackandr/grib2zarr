@@ -20,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 grib2zarr = "grib2zarr:cli"
+rechunk2zarr = "rechunk:cli"
 
 [tool.setuptools]
 py-modules = ["grib2zarr", "config_parser", "rechunk", "s3_store"]
