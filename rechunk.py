@@ -56,14 +56,16 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import os
-import shutil
 import tempfile
 import time
+import uuid
 import warnings
 from typing import Optional
 
 import numpy as np
 import zarr
+
+from s3_store import delete_store, open_store
 
 _log = logging.getLogger(__name__)
 
@@ -113,20 +115,26 @@ def rechunk_zarr(
         workers can be kept busy simultaneously.  Defaults to ``1``
         (sequential, no child processes spawned).
     """
-    src_group = zarr.open_group(src_path, mode="r", zarr_format=2)
-    dst_group = zarr.open_group(dst_path, mode="w", zarr_format=2)
+    src_group = zarr.open_group(open_store(src_path), mode="r", zarr_format=2)
+    dst_group = zarr.open_group(open_store(dst_path), mode="w", zarr_format=2)
 
     # Copy group-level attributes to the destination.
     dst_group.attrs.update(dict(src_group.attrs))
 
     _own_tmp = tmp_path is None
     if _own_tmp:
-        tmp_dir = tempfile.mkdtemp(
-            prefix="rechunk_tmp_", dir=os.path.dirname(os.path.abspath(dst_path))
-        )
-        tmp_path = tmp_dir
+        if dst_path.startswith("s3://"):
+            # For S3 destinations, create the temp store on S3 alongside the
+            # destination path.  A short random suffix prevents collisions when
+            # multiple rechunk operations target the same destination.
+            tmp_path = dst_path.rstrip("/") + f"_tmp_{uuid.uuid4().hex[:8]}"
+        else:
+            tmp_dir = tempfile.mkdtemp(
+                prefix="rechunk_tmp_", dir=os.path.dirname(os.path.abspath(dst_path))
+            )
+            tmp_path = tmp_dir
     # Initialise the shared temporary store so workers can open it in append mode.
-    zarr.open_group(tmp_path, mode="w", zarr_format=2)
+    zarr.open_group(open_store(tmp_path), mode="w", zarr_format=2)
 
     array_names = [name for name, _ in src_group.arrays()]
     task_args = [
@@ -149,11 +157,11 @@ def rechunk_zarr(
                     _log.info("rechunk  finished '%s'", done)
     finally:
         if cleanup_tmp and _own_tmp:
-            shutil.rmtree(tmp_path, ignore_errors=True)
+            delete_store(tmp_path)
 
     # Write consolidated metadata (.zmetadata) so tools like xarray can read
     # the store without scanning every array individually.
-    zarr.consolidate_metadata(dst_path)
+    zarr.consolidate_metadata(open_store(dst_path))
 
 
 def _copy_array(name: str, src: zarr.Array, dst_group: zarr.Group) -> None:
@@ -332,9 +340,9 @@ def _rechunk_variable_worker(task_args: tuple) -> str:
         cleanup_tmp,
     ) = task_args
 
-    src_group = zarr.open_group(src_path, mode="r", zarr_format=2)
+    src_group = zarr.open_group(open_store(src_path), mode="r", zarr_format=2)
     src = src_group[name]
-    dst_group = zarr.open_group(dst_path, mode="a", zarr_format=2)
+    dst_group = zarr.open_group(open_store(dst_path), mode="a", zarr_format=2)
 
     if src.ndim != 4:
         # Copy coordinate and auxiliary arrays (e.g. time, level, y, x)
@@ -342,7 +350,7 @@ def _rechunk_variable_worker(task_args: tuple) -> str:
         _copy_array(name=name, src=src, dst_group=dst_group)
         return name
 
-    tmp_group = zarr.open_group(tmp_path, mode="a", zarr_format=2)
+    tmp_group = zarr.open_group(open_store(tmp_path), mode="a", zarr_format=2)
     _rechunk_array(
         name=name,
         src=src,

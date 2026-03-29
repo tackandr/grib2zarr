@@ -15,10 +15,11 @@ dependencies = [
     "dask[array]>=2023.1.0",
     "numpy>=1.24.0",
     "pyyaml>=6.0",
+    "s3fs>=2023.1.0",
 ]
 
 [project.scripts]
 grib2zarr = "grib2zarr:cli"
 
 [tool.setuptools]
-py-modules = ["grib2zarr", "config_parser", "rechunk"]
+py-modules = ["grib2zarr", "config_parser", "rechunk", "s3_store"]
