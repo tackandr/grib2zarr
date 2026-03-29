@@ -337,10 +337,10 @@ async def write_slice(
     # Last two dims are always the spatial (y, x) dims
     spatial_dims = set(dim_names[-2:]) if len(dim_names) >= 2 else set()
 
-    # Reshape flat values to (ny, nx)
+    # Reshape flat values to (ny, nx) and cast to float32.
     ny = da_var.sizes[dim_names[-2]]
     nx = da_var.sizes[dim_names[-1]]
-    grid = values.reshape(ny, nx)
+    grid = values.reshape(ny, nx).astype("float32")
 
     # Build the numpy index tuple for writing directly into the zarr array.
     # Integer indices are used for the time and vertical dimensions so that
