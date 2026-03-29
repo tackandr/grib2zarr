@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import logging
 import sys
+import time
 from datetime import datetime
 from typing import List, Optional, Union
 
@@ -39,6 +40,8 @@ from rechunk import rechunk_zarr
 
 # Default output path
 DEFAULT_ZARR_PATH = "myfile.zarr"
+
+_log = logging.getLogger(__name__)
 
 # Named constants used in time-index matching
 _SECONDS_PER_HOUR: float = 3600.0
@@ -252,6 +255,9 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
                 keys_needed.update(dim_ref.get("grib2", {}).keys())
 
     for grib_file_path in grib_file_paths:
+        _log.info("extract  file='%s'  scanning …", grib_file_path)
+        t_file_start = time.perf_counter()
+        matched_count = 0
         with open(grib_file_path, "rb") as f:
             while True:
                 gid = codes_grib_new_from_file(f)
@@ -289,6 +295,7 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
                     if z_idx is not None and t_idx is not None:
                         values = codes_get_values(gid)
                         codes_release(gid)
+                        matched_count += 1
                         yield (var_name, t_idx, z_idx, values)
                     else:
                         codes_release(gid)
@@ -298,6 +305,13 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
                 # Yield control back to the event loop between messages so that
                 # the consumer can make progress while reading is ongoing.
                 await asyncio.sleep(0)
+        t_file_elapsed = time.perf_counter() - t_file_start
+        _log.info(
+            "extract  file='%s'  matched=%d  elapsed=%.1fs",
+            grib_file_path,
+            matched_count,
+            t_file_elapsed,
+        )
 
 
 async def write_slice(
@@ -445,6 +459,19 @@ async def main(
     matchers = _build_var_matcher(config)
     var_names = [m[0] for m in matchers]
 
+    if isinstance(grib_file_paths, list):
+        n_files = len(grib_file_paths)
+    else:
+        n_files = 1
+
+    _log.info(
+        "extract  files=%d  variables=%s  output='%s'",
+        n_files,
+        var_names,
+        zarr_path,
+    )
+    t_extract_start = time.perf_counter()
+
     queue: asyncio.Queue = asyncio.Queue()
     producer_task = asyncio.create_task(producer(queue, grib_file_paths, matchers))
     consumer_task = asyncio.create_task(consumer(queue, ds, zarr_path))
@@ -453,19 +480,17 @@ async def main(
     await queue.join()
     await consumer_task
 
-    if isinstance(grib_file_paths, list):
-        files_str = ", ".join(f"'{p}'" for p in grib_file_paths)
-    else:
-        files_str = f"'{grib_file_paths}'"
-    print(
-        f"Done. Variables {', '.join(var_names)} written to '{zarr_path}' "
-        f"from {files_str} using config '{config_path}'."
+    t_extract_elapsed = time.perf_counter() - t_extract_start
+    _log.info(
+        "extract  done  total=%.1fs  output='%s'",
+        t_extract_elapsed,
+        zarr_path,
     )
 
     if rechunk_path is not None:
-        print(f"Rechunking '{zarr_path}' → '{rechunk_path}' …")
+        _log.info("rechunk  src='%s'  dst='%s'", zarr_path, rechunk_path)
         rechunk_zarr(src_path=zarr_path, dst_path=rechunk_path, cleanup_tmp=cleanup_tmp)
-        print(f"Rechunking complete. Rechunked store written to '{rechunk_path}'.")
+        _log.info("rechunk  done  output='%s'", rechunk_path)
 
 
 def _parse_args(argv=None):
