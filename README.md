@@ -49,6 +49,16 @@ podman run --rm \
     --output /data/myfile.zarr
 ```
 
+To rechunk inside the container, override the entrypoint:
+
+```bash
+podman run --rm \
+    -v /path/to/data:/data \
+    --entrypoint rechunk2zarr \
+    grib2zarr \
+    /data/myfile.zarr /data/myfile_rechunked.zarr
+```
+
 ## Usage
 
 ### grib2zarr
