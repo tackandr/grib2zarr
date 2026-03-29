@@ -75,8 +75,9 @@ def rechunk_zarr(
     """Rechunk a 4-D Zarr array via a two-pass algorithm using a temporary store.
 
     The source array is expected to have shape ``(T, C, Y, X)`` – typically
-    ``(n_timesteps, n_levels, n_lats, n_lons)``.  All arrays at the top level
-    of the source Zarr group are rechunked into the destination group.
+    ``(n_timesteps, n_levels, n_lats, n_lons)``.  Only 4-D data arrays are
+    rechunked; coordinate and auxiliary arrays (e.g. ``time``, ``level``,
+    ``y``, ``x``) are automatically skipped.
 
     Parameters
     ----------
@@ -100,11 +101,6 @@ def rechunk_zarr(
     cleanup_tmp:
         When ``True`` (default) the temporary store is deleted after Pass 2
         completes.  Set to ``False`` to keep it for debugging.
-
-    Raises
-    ------
-    ValueError
-        If any source array is not 4-dimensional.
     """
     src_group = zarr.open_group(src_path, mode="r", zarr_format=2)
     dst_group = zarr.open_group(dst_path, mode="w", zarr_format=2)
@@ -119,6 +115,10 @@ def rechunk_zarr(
 
     try:
         for name, src in src_group.arrays():
+            if src.ndim != 4:
+                # Skip coordinate and auxiliary arrays (e.g. time, level, y, x).
+                # Only 4-D data variables are rechunked.
+                continue
             _rechunk_array(
                 name=name,
                 src=src,
