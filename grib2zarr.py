@@ -417,6 +417,7 @@ async def main(
     zarr_path: str,
     config_path: str,
     rechunk_path: Optional[str] = None,
+    cleanup_tmp: bool = True,
 ) -> None:
     """Orchestrate the producer/consumer pipeline.
 
@@ -432,7 +433,12 @@ async def main(
         When provided, the data written to *zarr_path* is rechunked into a
         new Zarr store at this path using :func:`rechunk.rechunk_zarr` as a
         finalizing action.  A temporary intermediate store is created
-        automatically and removed after rechunking completes.
+        automatically and removed after rechunking completes (unless
+        *cleanup_tmp* is ``False``).
+    cleanup_tmp:
+        When ``True`` (default) the intermediate temporary store created
+        during rechunking is deleted automatically.  Set to ``False`` to
+        keep it for debugging.  Has no effect when *rechunk_path* is ``None``.
     """
     config = load_config(config_path)
     ds = initialise_zarr(zarr_path, config)
@@ -458,7 +464,7 @@ async def main(
 
     if rechunk_path is not None:
         print(f"Rechunking '{zarr_path}' → '{rechunk_path}' …")
-        rechunk_zarr(src_path=zarr_path, dst_path=rechunk_path)
+        rechunk_zarr(src_path=zarr_path, dst_path=rechunk_path, cleanup_tmp=cleanup_tmp)
         print(f"Rechunking complete. Rechunked store written to '{rechunk_path}'.")
 
 
@@ -509,6 +515,17 @@ def _parse_args(argv=None):
         default=False,
         help="Enable INFO-level logging (shows rechunk timing, progress, etc.).",
     )
+    parser.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        default=False,
+        dest="no_cleanup",
+        help=(
+            "When specified, keep the intermediate temporary Zarr store that is "
+            "created during rechunking instead of deleting it automatically.  "
+            "Useful for debugging.  Has no effect when --rechunk is not used."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -521,7 +538,7 @@ def cli() -> None:
             format="%(asctime)s %(levelname)s %(message)s",
             datefmt="%H:%M:%S",
         )
-    asyncio.run(main(args.grib_files, args.zarr_path, args.config, args.rechunk_path))
+    asyncio.run(main(args.grib_files, args.zarr_path, args.config, args.rechunk_path, not args.no_cleanup))
 
 
 if __name__ == "__main__":
