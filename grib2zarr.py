@@ -477,7 +477,12 @@ def _parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """Console-script entry point installed by ``pip install``."""
     args = _parse_args(sys.argv[1:])
     asyncio.run(main(args.grib_files, args.zarr_path, args.config))
+
+
+if __name__ == "__main__":
+    cli()
 

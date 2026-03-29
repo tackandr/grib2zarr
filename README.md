@@ -10,53 +10,69 @@ Extract parameters from a GRIB2 file and store them in a [Zarr](https://zarr.dev
 
 ## Requirements
 
-Install the Python dependencies:
+> **Note:** `eccodes` requires the ECMWF eccodes C library to be installed on
+> your system (`libeccodes-dev` on Debian/Ubuntu, `eccodes` via Homebrew on macOS).
+
+## Installation
 
 ```bash
-pip install -r requirements.txt
+# Install the eccodes C library (Debian/Ubuntu)
+sudo apt-get install libeccodes-dev
+
+# Create a virtual environment and install the package in editable mode
+python3 -m venv venv && source venv/bin/activate
+pip install -e .
 ```
 
-> **Note:** `eccodes` also requires the ECMWF eccodes C library to be installed on
-> your system (`libeccodes-dev` on Debian/Ubuntu, `eccodes` via Homebrew on macOS).
+After installation a `grib2zarr` command is available on your `PATH`.
+
+## Container (Podman / Docker)
+
+Build the image:
+
+```bash
+podman build -t grib2zarr -f Containerfile .
+```
+
+Run the container, mounting the directory that contains your GRIB2 files and
+config:
+
+```bash
+podman run --rm \
+    -v /path/to/data:/data \
+    grib2zarr \
+    /data/fc2026032709+001grib2_mbr000 \
+    --config /data/config.yaml \
+    --output /data/myfile.zarr
+```
 
 ## Usage
 
 ```bash
-python grib2zarr.py <grib_file> [output_zarr_path] [--params PARAM ...]
+grib2zarr GRIB_FILE [GRIB_FILE ...] --config CONFIG [--output ZARR_PATH]
 ```
 
-| Argument           | Description                                                  | Default        |
-|--------------------|--------------------------------------------------------------|----------------|
-| `grib_file`        | Path to the input GRIB2 file (required)                      | —              |
-| `output_zarr_path` | Destination Zarr store directory (optional)                  | `myfile.zarr`  |
-| `--params`         | One or more GRIB shortNames to extract (optional, repeatable)| `u`            |
+| Argument      | Description                                          | Default       |
+|---------------|------------------------------------------------------|---------------|
+| `GRIB_FILE`   | Path(s) to one or more input GRIB2 files (required)  | —             |
+| `--config`    | Path to the YAML configuration file (required)       | —             |
+| `--output`    | Destination Zarr store path                          | `myfile.zarr` |
 
 ### Example
 
 ```bash
-# Extract only u (default)
-python grib2zarr.py fc2026032709+001grib2_mbr000 myfile.zarr
-
-# Extract u and v
-python grib2zarr.py fc2026032709+001grib2_mbr000 myfile.zarr --params u v
-
-# Extract u, v, and temperature
-python grib2zarr.py fc2026032709+001grib2_mbr000 myfile.zarr --params u v t
+grib2zarr fc2026032709+001grib2_mbr000 fc2026032709+002grib2_mbr000 \
+    --config config.yaml --output myfile.zarr
 ```
 
 ## How it works
 
-1. **Initialise** – An empty Zarr store is created with one variable per requested
-   parameter, each with shape `(66, 1069, 949)` and chunk size `(1, 1069, 949)`.
-2. **Producer** – Reads GRIB2 messages one by one and puts them on an
-   `asyncio.Queue`.  Grid values are only decoded for messages whose shortName
-   matches one of the requested parameters; all other messages are skipped cheaply.
-3. **Consumer** – Picks messages off the queue and calls `write_slice()` for every
-   matching parameter, writing each level slice directly into the Zarr store using
-   `xr.DataArray.to_zarr(..., region=...)`.
+1. **Initialise** – An empty Zarr store is created from the YAML configuration: shape,
+   chunk layout, coordinates, CRS and CF attributes are all derived from the config.
+2. **Producer** – Reads GRIB2 messages one by one and puts matched messages on an
+   `asyncio.Queue`.  Variables are identified by their GRIB2
+   `discipline`/`parameterCategory`/`parameterNumber` keys; unmatched messages are
+   skipped cheaply.
+3. **Consumer** – Picks messages off the queue and writes each level slice directly
+   into the Zarr store.
 
-## Grid assumptions
-
-The defaults match a 66-level NWP model output on a 1069 × 949 grid.  If your
-data has a different shape, edit `SHAPE` and `CHUNKS` at the top of
-`grib2zarr.py`.
