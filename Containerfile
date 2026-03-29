@@ -9,7 +9,7 @@ WORKDIR /app
 
 # Copy the project files and install the package
 COPY pyproject.toml ./
-COPY grib2zarr.py config_parser.py ./
+COPY grib2zarr.py config_parser.py rechunk.py s3_store.py ./
 
 RUN pip install --no-cache-dir .
 
