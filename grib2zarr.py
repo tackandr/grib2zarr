@@ -22,7 +22,7 @@ import argparse
 import asyncio
 import sys
 from datetime import datetime
-from typing import List, Union
+from typing import List, Optional, Union
 
 import xarray as xr
 import zarr
@@ -34,6 +34,7 @@ from eccodes import (
 )
 
 from config_parser import build_dataset, load_config, _eval_values
+from rechunk import rechunk_zarr
 
 # Default output path
 DEFAULT_ZARR_PATH = "myfile.zarr"
@@ -410,7 +411,12 @@ async def consumer(
         queue.task_done()
 
 
-async def main(grib_file_paths: Union[str, List[str]], zarr_path: str, config_path: str) -> None:
+async def main(
+    grib_file_paths: Union[str, List[str]],
+    zarr_path: str,
+    config_path: str,
+    rechunk_path: Optional[str] = None,
+) -> None:
     """Orchestrate the producer/consumer pipeline.
 
     Parameters
@@ -421,6 +427,11 @@ async def main(grib_file_paths: Union[str, List[str]], zarr_path: str, config_pa
         Destination Zarr store path.
     config_path:
         Path to the YAML configuration file describing the target dataset.
+    rechunk_path:
+        When provided, the data written to *zarr_path* is rechunked into a
+        new Zarr store at this path using :func:`rechunk.rechunk_zarr` as a
+        finalizing action.  A temporary intermediate store is created
+        automatically and removed after rechunking completes.
     """
     config = load_config(config_path)
     ds = initialise_zarr(zarr_path, config)
@@ -443,6 +454,11 @@ async def main(grib_file_paths: Union[str, List[str]], zarr_path: str, config_pa
         f"Done. Variables {', '.join(var_names)} written to '{zarr_path}' "
         f"from {files_str} using config '{config_path}'."
     )
+
+    if rechunk_path is not None:
+        print(f"Rechunking '{zarr_path}' → '{rechunk_path}' …")
+        rechunk_zarr(src_path=zarr_path, dst_path=rechunk_path)
+        print(f"Rechunking complete. Rechunked store written to '{rechunk_path}'.")
 
 
 def _parse_args(argv=None):
@@ -474,13 +490,24 @@ def _parse_args(argv=None):
             "(discipline/parameterCategory/parameterNumber)."
         ),
     )
+    parser.add_argument(
+        "--rechunk",
+        default=None,
+        metavar="RECHUNK_PATH",
+        dest="rechunk_path",
+        help=(
+            "When specified, rechunk the output Zarr store into a new store at "
+            "this path using a two-pass algorithm.  A temporary intermediate "
+            "store is created automatically and removed on completion."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def cli() -> None:
     """Console-script entry point installed by ``pip install``."""
     args = _parse_args(sys.argv[1:])
-    asyncio.run(main(args.grib_files, args.zarr_path, args.config))
+    asyncio.run(main(args.grib_files, args.zarr_path, args.config, args.rechunk_path))
 
 
 if __name__ == "__main__":

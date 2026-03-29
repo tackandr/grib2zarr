@@ -21,4 +21,4 @@ dependencies = [
 grib2zarr = "grib2zarr:cli"
 
 [tool.setuptools]
-py-modules = ["grib2zarr", "config_parser"]
+py-modules = ["grib2zarr", "config_parser", "rechunk"]
