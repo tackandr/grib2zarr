@@ -20,6 +20,7 @@ Example:
 
 import argparse
 import asyncio
+import logging
 import sys
 from datetime import datetime
 from typing import List, Optional, Union
@@ -501,12 +502,25 @@ def _parse_args(argv=None):
             "store is created automatically and removed on completion."
         ),
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable INFO-level logging (shows rechunk timing, progress, etc.).",
+    )
     return parser.parse_args(argv)
 
 
 def cli() -> None:
     """Console-script entry point installed by ``pip install``."""
     args = _parse_args(sys.argv[1:])
+    if args.verbose:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        )
     asyncio.run(main(args.grib_files, args.zarr_path, args.config, args.rechunk_path))
 
 

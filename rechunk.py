@@ -166,7 +166,8 @@ def _copy_array(name: str, src: zarr.Array, dst_group: zarr.Group) -> None:
         compressors=src_compressor,
         overwrite=True,
     )
-    dst[:] = src[:]
+    # Use Ellipsis indexing so that 0-D (scalar) arrays are handled correctly.
+    dst[...] = src[...]
     dst.attrs.update(dict(src.attrs))
 
 
