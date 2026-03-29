@@ -20,9 +20,11 @@ Example:
 
 import argparse
 import asyncio
+import logging
 import sys
+import time
 from datetime import datetime
-from typing import List, Union
+from typing import List, Optional, Union
 
 import xarray as xr
 import zarr
@@ -34,9 +36,12 @@ from eccodes import (
 )
 
 from config_parser import build_dataset, load_config, _eval_values
+from rechunk import rechunk_zarr
 
 # Default output path
 DEFAULT_ZARR_PATH = "myfile.zarr"
+
+_log = logging.getLogger(__name__)
 
 # Named constants used in time-index matching
 _SECONDS_PER_HOUR: float = 3600.0
@@ -250,6 +255,9 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
                 keys_needed.update(dim_ref.get("grib2", {}).keys())
 
     for grib_file_path in grib_file_paths:
+        _log.info("extract  file='%s'  scanning …", grib_file_path)
+        t_file_start = time.perf_counter()
+        matched_count = 0
         with open(grib_file_path, "rb") as f:
             while True:
                 gid = codes_grib_new_from_file(f)
@@ -287,6 +295,7 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
                     if z_idx is not None and t_idx is not None:
                         values = codes_get_values(gid)
                         codes_release(gid)
+                        matched_count += 1
                         yield (var_name, t_idx, z_idx, values)
                     else:
                         codes_release(gid)
@@ -296,6 +305,13 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
                 # Yield control back to the event loop between messages so that
                 # the consumer can make progress while reading is ongoing.
                 await asyncio.sleep(0)
+        t_file_elapsed = time.perf_counter() - t_file_start
+        _log.info(
+            "extract  file='%s'  matched=%d  elapsed=%.1fs",
+            grib_file_path,
+            matched_count,
+            t_file_elapsed,
+        )
 
 
 async def write_slice(
@@ -335,10 +351,10 @@ async def write_slice(
     # Last two dims are always the spatial (y, x) dims
     spatial_dims = set(dim_names[-2:]) if len(dim_names) >= 2 else set()
 
-    # Reshape flat values to (ny, nx)
+    # Reshape flat values to (ny, nx) and cast to float32.
     ny = da_var.sizes[dim_names[-2]]
     nx = da_var.sizes[dim_names[-1]]
-    grid = values.reshape(ny, nx)
+    grid = values.reshape(ny, nx).astype("float32")
 
     # Build the numpy index tuple for writing directly into the zarr array.
     # Integer indices are used for the time and vertical dimensions so that
@@ -410,7 +426,13 @@ async def consumer(
         queue.task_done()
 
 
-async def main(grib_file_paths: Union[str, List[str]], zarr_path: str, config_path: str) -> None:
+async def main(
+    grib_file_paths: Union[str, List[str]],
+    zarr_path: str,
+    config_path: str,
+    rechunk_path: Optional[str] = None,
+    cleanup_tmp: bool = True,
+) -> None:
     """Orchestrate the producer/consumer pipeline.
 
     Parameters
@@ -421,11 +443,34 @@ async def main(grib_file_paths: Union[str, List[str]], zarr_path: str, config_pa
         Destination Zarr store path.
     config_path:
         Path to the YAML configuration file describing the target dataset.
+    rechunk_path:
+        When provided, the data written to *zarr_path* is rechunked into a
+        new Zarr store at this path using :func:`rechunk.rechunk_zarr` as a
+        finalizing action.  A temporary intermediate store is created
+        automatically and removed after rechunking completes (unless
+        *cleanup_tmp* is ``False``).
+    cleanup_tmp:
+        When ``True`` (default) the intermediate temporary store created
+        during rechunking is deleted automatically.  Set to ``False`` to
+        keep it for debugging.  Has no effect when *rechunk_path* is ``None``.
     """
     config = load_config(config_path)
     ds = initialise_zarr(zarr_path, config)
     matchers = _build_var_matcher(config)
     var_names = [m[0] for m in matchers]
+
+    if isinstance(grib_file_paths, list):
+        n_files = len(grib_file_paths)
+    else:
+        n_files = 1
+
+    _log.info(
+        "extract  files=%d  variables=%s  output='%s'",
+        n_files,
+        var_names,
+        zarr_path,
+    )
+    t_extract_start = time.perf_counter()
 
     queue: asyncio.Queue = asyncio.Queue()
     producer_task = asyncio.create_task(producer(queue, grib_file_paths, matchers))
@@ -435,14 +480,17 @@ async def main(grib_file_paths: Union[str, List[str]], zarr_path: str, config_pa
     await queue.join()
     await consumer_task
 
-    if isinstance(grib_file_paths, list):
-        files_str = ", ".join(f"'{p}'" for p in grib_file_paths)
-    else:
-        files_str = f"'{grib_file_paths}'"
-    print(
-        f"Done. Variables {', '.join(var_names)} written to '{zarr_path}' "
-        f"from {files_str} using config '{config_path}'."
+    t_extract_elapsed = time.perf_counter() - t_extract_start
+    _log.info(
+        "extract  done  total=%.1fs  output='%s'",
+        t_extract_elapsed,
+        zarr_path,
     )
+
+    if rechunk_path is not None:
+        _log.info("rechunk  src='%s'  dst='%s'", zarr_path, rechunk_path)
+        rechunk_zarr(src_path=zarr_path, dst_path=rechunk_path, cleanup_tmp=cleanup_tmp)
+        _log.info("rechunk  done  output='%s'", rechunk_path)
 
 
 def _parse_args(argv=None):
@@ -474,13 +522,48 @@ def _parse_args(argv=None):
             "(discipline/parameterCategory/parameterNumber)."
         ),
     )
+    parser.add_argument(
+        "--rechunk",
+        default=None,
+        metavar="RECHUNK_PATH",
+        dest="rechunk_path",
+        help=(
+            "When specified, rechunk the output Zarr store into a new store at "
+            "this path using a two-pass algorithm.  A temporary intermediate "
+            "store is created automatically and removed on completion."
+        ),
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable INFO-level logging (shows rechunk timing, progress, etc.).",
+    )
+    parser.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        default=False,
+        dest="no_cleanup",
+        help=(
+            "When specified, keep the intermediate temporary Zarr store that is "
+            "created during rechunking instead of deleting it automatically.  "
+            "Useful for debugging.  Has no effect when --rechunk is not used."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def cli() -> None:
     """Console-script entry point installed by ``pip install``."""
     args = _parse_args(sys.argv[1:])
-    asyncio.run(main(args.grib_files, args.zarr_path, args.config))
+    if args.verbose:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    asyncio.run(main(args.grib_files, args.zarr_path, args.config, args.rechunk_path, not args.no_cleanup))
 
 
 if __name__ == "__main__":

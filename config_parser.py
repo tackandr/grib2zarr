@@ -196,7 +196,7 @@ def build_dataset(config: dict) -> xr.Dataset:
         if not shape:
             continue
 
-        data = da.empty(shape, chunks=tuple(chunks))
+        data = da.empty(shape, chunks=tuple(chunks), dtype=np.float32)
         data_vars[var_name] = xr.DataArray(data, dims=dim_names, attrs=cf_attrs)
 
     return xr.Dataset(data_vars, coords=coords)
