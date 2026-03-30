@@ -29,6 +29,13 @@ Typical RAM usage for float32 data of shape ``(67, 66, 1069, 949)``:
 * Pass 1 buffer: ~97 MiB  (24 × 1 × 1069 × 949 elements)
 * Pass 2 buffer: ~60 MiB  (24 × 66 × 100 × 100 elements)
 
+When ``in_memory=True`` (or ``--in-memory`` on the CLI) the intermediate
+Pass-1 store is kept entirely in RAM using a :class:`zarr.storage.MemoryStore`
+instead of being written to a scratch directory.  This eliminates all
+temporary disk I/O at the cost of higher peak RAM usage during Pass 1.
+Each variable uses an independent in-memory store so the option is fully
+compatible with multi-worker (``-j N``) execution.
+
 Usage
 -----
 As a library::
@@ -45,9 +52,19 @@ As a library::
         cleanup_tmp=True,
     )
 
+    # In-memory intermediate store (no scratch disk needed):
+    rechunk_zarr(
+        src_path="myfile.zarr",
+        dst_path="myfile_rechunked.zarr",
+        in_memory=True,
+    )
+
 Via the ``rechunk2zarr`` CLI::
 
     rechunk2zarr myfile.zarr rechunked.zarr --t-chunk 24 --spatial-chunk 100 --verbose
+
+    # In-memory pass-1 (no scratch disk):
+    rechunk2zarr myfile.zarr rechunked.zarr --in-memory --verbose
 """
 
 from __future__ import annotations
@@ -79,6 +96,7 @@ def rechunk_zarr(
     tmp_path: Optional[str] = None,
     cleanup_tmp: bool = True,
     workers: int = 1,
+    in_memory: bool = False,
 ) -> None:
     """Rechunk a 4-D Zarr array via a two-pass algorithm using a temporary store.
 
@@ -106,40 +124,62 @@ def rechunk_zarr(
         Path for the intermediate temporary Zarr store.  When ``None`` a
         temporary directory inside ``dst_path``'s parent is created
         automatically and removed after use (controlled by *cleanup_tmp*).
+        Mutually exclusive with *in_memory*.
     cleanup_tmp:
         When ``True`` (default) the temporary store is deleted after Pass 2
-        completes.  Set to ``False`` to keep it for debugging.
+        completes.  Set to ``False`` to keep it for debugging.  Has no effect
+        when *in_memory* is ``True``.
     workers:
         Number of parallel worker processes used to rechunk variables.  Each
         variable is rechunked independently, so up to ``len(variables)``
         workers can be kept busy simultaneously.  Defaults to ``1``
         (sequential, no child processes spawned).
+    in_memory:
+        When ``True`` the intermediate Pass-1 store is held entirely in RAM
+        using a :class:`zarr.storage.MemoryStore` instead of being written to
+        a scratch directory on disk.  This eliminates all temporary disk I/O
+        at the cost of higher peak RAM.  Each variable uses an independent
+        in-memory store, so the option is fully compatible with *workers > 1*.
+        Mutually exclusive with *tmp_path*.
+
+    Raises
+    ------
+    ValueError
+        If both *in_memory* and *tmp_path* are supplied simultaneously.
     """
+    if in_memory and tmp_path is not None:
+        raise ValueError(
+            "in_memory=True is incompatible with a user-supplied tmp_path. "
+            "Pass 1 data is stored in RAM and no on-disk temporary store is used."
+        )
+
     src_group = zarr.open_group(open_store(src_path), mode="r", zarr_format=2)
     dst_group = zarr.open_group(open_store(dst_path), mode="w", zarr_format=2)
 
     # Copy group-level attributes to the destination.
     dst_group.attrs.update(dict(src_group.attrs))
 
-    _own_tmp = tmp_path is None
-    if _own_tmp:
-        if dst_path.startswith("s3://"):
-            # For S3 destinations keep the intermediate temp store on the local
-            # scratch disk.  Writing pass-1 data to S3 one slice at a time would
-            # be extremely slow; local I/O is fast and the data is discarded
-            # after pass 2 completes.
-            tmp_dir = tempfile.mkdtemp(prefix="rechunk_tmp_")
-        else:
-            tmp_dir = tempfile.mkdtemp(
-                prefix="rechunk_tmp_", dir=os.path.dirname(os.path.abspath(dst_path))
-            )
-        tmp_path = tmp_dir
-    # Initialise the shared temporary store so workers can open it in append mode.
-    zarr.open_group(open_store(tmp_path), mode="w", zarr_format=2)
+    _own_tmp = False
+    if not in_memory:
+        _own_tmp = tmp_path is None
+        if _own_tmp:
+            if dst_path.startswith("s3://"):
+                # For S3 destinations keep the intermediate temp store on the local
+                # scratch disk.  Writing pass-1 data to S3 one slice at a time would
+                # be extremely slow; local I/O is fast and the data is discarded
+                # after pass 2 completes.
+                tmp_dir = tempfile.mkdtemp(prefix="rechunk_tmp_")
+            else:
+                tmp_dir = tempfile.mkdtemp(
+                    prefix="rechunk_tmp_", dir=os.path.dirname(os.path.abspath(dst_path))
+                )
+            tmp_path = tmp_dir
+        # Initialise the shared temporary store so workers can open it in append mode.
+        zarr.open_group(open_store(tmp_path), mode="w", zarr_format=2)
 
     array_names = [name for name, _ in src_group.arrays()]
     task_args = [
-        (name, src_path, tmp_path, dst_path, t_chunk, c_chunk, spatial_chunk, cleanup_tmp)
+        (name, src_path, tmp_path, dst_path, t_chunk, c_chunk, spatial_chunk, cleanup_tmp, in_memory)
         for name in array_names
     ]
 
@@ -318,12 +358,17 @@ def _rechunk_variable_worker(task_args: tuple) -> str:
     Zarr stores by path (zarr objects are **not** passed across process
     boundaries).
 
+    When *in_memory* is ``True`` an independent :class:`zarr.storage.MemoryStore`
+    is created locally for the Pass-1 intermediate data instead of opening the
+    on-disk temporary store.  The store is discarded automatically when the
+    function returns.
+
     Parameters
     ----------
     task_args:
-        An 8-tuple of
+        A 9-tuple of
         ``(name, src_path, tmp_path, dst_path, t_chunk, c_chunk,
-        spatial_chunk, cleanup_tmp)``.
+        spatial_chunk, cleanup_tmp, in_memory)``.
 
     Returns
     -------
@@ -339,6 +384,7 @@ def _rechunk_variable_worker(task_args: tuple) -> str:
         c_chunk,
         spatial_chunk,
         cleanup_tmp,
+        in_memory,
     ) = task_args
 
     src_group = zarr.open_group(open_store(src_path), mode="r", zarr_format=2)
@@ -351,7 +397,13 @@ def _rechunk_variable_worker(task_args: tuple) -> str:
         _copy_array(name=name, src=src, dst_group=dst_group)
         return name
 
-    tmp_group = zarr.open_group(open_store(tmp_path), mode="a", zarr_format=2)
+    if in_memory:
+        # Each variable gets its own independent in-memory store so no
+        # coordination between workers is needed and no disk space is used.
+        tmp_group = zarr.open_group(zarr.storage.MemoryStore(), mode="w", zarr_format=2)
+    else:
+        tmp_group = zarr.open_group(open_store(tmp_path), mode="a", zarr_format=2)
+
     _rechunk_array(
         name=name,
         src=src,
@@ -363,7 +415,8 @@ def _rechunk_variable_worker(task_args: tuple) -> str:
     )
     # Delete this variable's temp data as soon as Pass 2 is done so
     # that disk space is freed incrementally rather than only at the end.
-    if cleanup_tmp and name in tmp_group:
+    # (No-op for the in-memory case as the store is discarded on return.)
+    if not in_memory and cleanup_tmp and name in tmp_group:
         del tmp_group[name]
 
     return name
@@ -449,6 +502,18 @@ def _parse_rechunk_args(argv=None):
         help="Chunk size for both spatial axes (Y and X) (default: 100).",
     )
     parser.add_argument(
+        "--in-memory",
+        action="store_true",
+        default=False,
+        dest="in_memory",
+        help=(
+            "Keep the intermediate Pass-1 Zarr store entirely in RAM instead of "
+            "writing it to a scratch directory on disk.  Eliminates all temporary "
+            "disk I/O at the cost of higher peak RAM usage.  Incompatible with "
+            "--tmp-path."
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -476,6 +541,7 @@ def cli() -> None:
         tmp_path=args.tmp_path,
         cleanup_tmp=not args.no_cleanup,
         workers=args.workers,
+        in_memory=args.in_memory,
     )
 
 
