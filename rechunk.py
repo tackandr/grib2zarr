@@ -53,6 +53,7 @@ Via the ``rechunk2zarr`` CLI::
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import multiprocessing
 import os
@@ -134,24 +135,35 @@ def rechunk_zarr(
                 prefix="rechunk_tmp_", dir=os.path.dirname(os.path.abspath(dst_path))
             )
         tmp_path = tmp_dir
-    # Initialise the shared temporary store so workers can open it in append mode.
-    zarr.open_group(open_store(tmp_path), mode="w", zarr_format=2)
+    tmp_group = zarr.open_group(open_store(tmp_path), mode="w", zarr_format=2)
 
-    array_names = [name for name, _ in src_group.arrays()]
+    # Pre-create all arrays in the destination and temporary stores.
+    # 4-D data arrays are created as empty (fill-value) arrays so that workers
+    # can open the stores in "r+" mode and write chunks straight from buffers.
+    # Coordinate and auxiliary arrays are copied verbatim to dst here.
+    rechunk_names = _initialise_rechunk_stores(
+        src_group=src_group,
+        dst_group=dst_group,
+        tmp_group=tmp_group,
+        t_chunk=t_chunk,
+        c_chunk=c_chunk,
+        spatial_chunk=spatial_chunk,
+    )
+
     task_args = [
-        (name, src_path, tmp_path, dst_path, t_chunk, c_chunk, spatial_chunk, cleanup_tmp)
-        for name in array_names
+        (name, src_path, tmp_path, dst_path, t_chunk, spatial_chunk, cleanup_tmp)
+        for name in rechunk_names
     ]
 
     try:
         if workers == 1:
-            _log.info("rechunk  variables=%d", len(array_names))
+            _log.info("rechunk  variables=%d", len(rechunk_names))
             for args in task_args:
                 done = _rechunk_variable_worker(args)
                 _log.info("rechunk  finished '%s'", done)
         else:
             _log.info(
-                "rechunk  workers=%d  variables=%d", workers, len(array_names)
+                "rechunk  workers=%d  variables=%d", workers, len(rechunk_names)
             )
             with multiprocessing.Pool(processes=workers) as pool:
                 for done in pool.map(_rechunk_variable_worker, task_args):
@@ -187,31 +199,273 @@ def _copy_array(name: str, src: zarr.Array, dst_group: zarr.Group) -> None:
     dst.attrs.update(dict(src.attrs))
 
 
+def _initialise_rechunk_stores(
+    src_group: zarr.Group,
+    dst_group: zarr.Group,
+    tmp_group: zarr.Group,
+    t_chunk: int,
+    c_chunk: Optional[int],
+    spatial_chunk: int,
+) -> list:
+    """Pre-create empty arrays in the destination and temporary stores.
+
+    Mirrors the pattern used by :func:`grib2zarr.initialise_zarr`, which
+    writes the Zarr schema with ``compute=False`` so that data can later be
+    written chunk-by-chunk in ``"r+"`` mode.
+
+    4-D data arrays are created as empty (fill-value) arrays with the target
+    chunk layout in *dst_group* and the pass-1 chunk layout in *tmp_group*;
+    no data is written to either.  All other arrays (coordinates, auxiliary
+    variables) are copied verbatim — data and attributes — to *dst_group*
+    since they are small and do not need rechunking.
+
+    Parameters
+    ----------
+    src_group:
+        Source Zarr group (opened in read mode).
+    dst_group:
+        Destination Zarr group (opened with ``mode="w"``).
+    tmp_group:
+        Temporary intermediate Zarr group (opened with ``mode="w"``).
+    t_chunk:
+        Chunk size along the leading time axis.
+    c_chunk:
+        Chunk size along the second (vertical) axis.  ``None`` means the full
+        axis length is used as one chunk.
+    spatial_chunk:
+        Chunk size for the spatial (Y and X) axes.
+
+    Returns
+    -------
+    list of str
+        Names of the 4-D arrays that need rechunking (used to build worker
+        task arguments).
+    """
+    rechunk_names = []
+    for name, src in src_group.arrays():
+        if src.ndim != 4:
+            # Coordinates and auxiliary arrays: copy verbatim to dst only.
+            _copy_array(name=name, src=src, dst_group=dst_group)
+            continue
+
+        T, C, Y, X = src.shape
+        effective_c_chunk = C if c_chunk is None else c_chunk
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            src_compressor = src.compressor
+
+        # Create an empty array in the temp store with pass-1 chunk layout
+        # (singleton vertical axis so each pass-1 buffer fits in RAM).
+        tmp_group.create_array(
+            name,
+            shape=src.shape,
+            chunks=(t_chunk, 1, spatial_chunk, spatial_chunk),
+            dtype=src.dtype,
+            compressors=None,
+            overwrite=True,
+        )
+
+        # Create an empty array in the dst store with the final chunk layout.
+        dst_arr = dst_group.create_array(
+            name,
+            shape=src.shape,
+            chunks=(t_chunk, effective_c_chunk, spatial_chunk, spatial_chunk),
+            dtype=src.dtype,
+            compressors=src_compressor,
+            overwrite=True,
+        )
+        dst_arr.attrs.update(dict(src.attrs))
+        rechunk_names.append(name)
+
+    return rechunk_names
+
+
+# ---------------------------------------------------------------------------
+# Async IO helpers – used by _rechunk_array to overlap read and write I/O.
+# ---------------------------------------------------------------------------
+
+
+def _read_block_pass1(
+    src: zarr.Array,
+    t0: int,
+    t1: int,
+    tlen: int,
+    c: int,
+    Y: int,
+    X: int,
+) -> np.ndarray:
+    """Read *tlen* time-steps for a single vertical level from *src*.
+
+    Returns an array of shape ``(tlen, 1, Y, X)``.
+    """
+    buf = np.empty((tlen, 1, Y, X), dtype=src.dtype)
+    for k, t in enumerate(range(t0, t1)):
+        buf[k, 0, :, :] = src[t, c, :, :]
+    return buf
+
+
+def _write_block_pass1(
+    tmp: zarr.Array,
+    t0: int,
+    t1: int,
+    c: int,
+    buf: np.ndarray,
+) -> None:
+    """Write a pass-1 buffer into the temporary store."""
+    tmp[t0:t1, c : c + 1, :, :] = buf
+
+
+async def _pass1_async(
+    src: zarr.Array,
+    tmp: zarr.Array,
+    t_chunk: int,
+    T: int,
+    C: int,
+    Y: int,
+    X: int,
+) -> None:
+    """Pass 1: merge the time axis with overlapping async read/write.
+
+    Reads one ``(t_chunk, 1, Y, X)`` block from *src* while the previous block
+    is being written to *tmp*, forming a one-deep read-ahead pipeline that
+    overlaps I/O.  Both read and write run in the default thread-pool executor
+    via :func:`asyncio.to_thread`; since numpy and zarr release the GIL during
+    array I/O the two operations can run concurrently on separate threads.
+    """
+    items = [(t0, c) for t0 in range(0, T, t_chunk) for c in range(C)]
+    if not items:
+        return
+
+    # Prime the pipeline with the first read.
+    t0, c = items[0]
+    t1 = min(t0 + t_chunk, T)
+    tlen = t1 - t0
+    buf = await asyncio.to_thread(_read_block_pass1, src, t0, t1, tlen, c, Y, X)
+
+    for t0_next, c_next in items[1:]:
+        t1_next = min(t0_next + t_chunk, T)
+        tlen_next = t1_next - t0_next
+        # Read next block while writing current block.
+        buf_next, _ = await asyncio.gather(
+            asyncio.to_thread(
+                _read_block_pass1, src, t0_next, t1_next, tlen_next, c_next, Y, X
+            ),
+            asyncio.to_thread(_write_block_pass1, tmp, t0, t1, c, buf),
+        )
+        buf = buf_next
+        t0, t1, c = t0_next, t1_next, c_next
+
+    # Flush the last buffer.
+    await asyncio.to_thread(_write_block_pass1, tmp, t0, t1, c, buf)
+
+
+def _read_block_pass2(
+    tmp: zarr.Array,
+    t0: int,
+    t1: int,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+) -> np.ndarray:
+    """Read a spatial tile covering all vertical levels from *tmp*."""
+    return tmp[t0:t1, :, y0:y1, x0:x1]
+
+
+def _write_block_pass2(
+    dst: zarr.Array,
+    t0: int,
+    t1: int,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+    buf: np.ndarray,
+) -> None:
+    """Write a spatial tile into the destination store."""
+    dst[t0:t1, :, y0:y1, x0:x1] = buf
+
+
+async def _pass2_async(
+    tmp: zarr.Array,
+    dst: zarr.Array,
+    t_chunk: int,
+    spatial_chunk: int,
+    T: int,
+    Y: int,
+    X: int,
+) -> None:
+    """Pass 2: merge vertical + tile spatially with overlapping async read/write.
+
+    Reads the next spatial tile from *tmp* while the previous tile is being
+    written to *dst*, forming a one-deep read-ahead pipeline that overlaps I/O.
+    """
+    items = [
+        (t0, y0, x0)
+        for t0 in range(0, T, t_chunk)
+        for y0 in range(0, Y, spatial_chunk)
+        for x0 in range(0, X, spatial_chunk)
+    ]
+    if not items:
+        return
+
+    # Prime the pipeline with the first read.
+    t0, y0, x0 = items[0]
+    t1 = min(t0 + t_chunk, T)
+    y1 = min(y0 + spatial_chunk, Y)
+    x1 = min(x0 + spatial_chunk, X)
+    buf = await asyncio.to_thread(_read_block_pass2, tmp, t0, t1, y0, y1, x0, x1)
+
+    for t0_next, y0_next, x0_next in items[1:]:
+        t1_next = min(t0_next + t_chunk, T)
+        y1_next = min(y0_next + spatial_chunk, Y)
+        x1_next = min(x0_next + spatial_chunk, X)
+        # Read next tile while writing current tile.
+        buf_next, _ = await asyncio.gather(
+            asyncio.to_thread(
+                _read_block_pass2, tmp, t0_next, t1_next, y0_next, y1_next, x0_next, x1_next
+            ),
+            asyncio.to_thread(_write_block_pass2, dst, t0, t1, y0, y1, x0, x1, buf),
+        )
+        buf = buf_next
+        t0, t1, y0, y1, x0, x1 = t0_next, t1_next, y0_next, y1_next, x0_next, x1_next
+
+    # Flush the last tile.
+    await asyncio.to_thread(_write_block_pass2, dst, t0, t1, y0, y1, x0, x1, buf)
+
+
 def _rechunk_array(
     name: str,
     src: zarr.Array,
     tmp_group: zarr.Group,
     dst_group: zarr.Group,
     t_chunk: int,
-    c_chunk: Optional[int],
     spatial_chunk: int,
 ) -> None:
-    """Rechunk a single Zarr array using the two-pass algorithm.
+    """Rechunk a single 4-D Zarr array using the two-pass algorithm.
+
+    The destination and temporary arrays must already exist in *dst_group* and
+    *tmp_group* respectively — created by :func:`_initialise_rechunk_stores` —
+    so they can be opened in ``"r+"`` mode.  Chunks are written straight from
+    in-memory buffers into the pre-allocated arrays.
+
+    Each pass uses an async read-ahead pipeline (:func:`_pass1_async`,
+    :func:`_pass2_async`) so that the read of the next block overlaps the write
+    of the current block, reducing wall-clock time when I/O is the bottleneck.
 
     Parameters
     ----------
     name:
-        Name of the array in both the temporary and destination groups.
+        Name of the array in the source, temporary, and destination groups.
     src:
         Source Zarr array.
     tmp_group:
-        Zarr group used for the intermediate temporary store.
+        Zarr group for the intermediate temporary store (``"r+"`` mode).
     dst_group:
-        Zarr group for the final output.
+        Zarr group for the final output (``"r+"`` mode).
     t_chunk:
         Chunk size along the leading time axis.
-    c_chunk:
-        Chunk size along axis 1.  ``None`` means the full axis length.
     spatial_chunk:
         Chunk size for axes 2 and 3 (Y and X).
 
@@ -227,46 +481,15 @@ def _rechunk_array(
         )
 
     T, C, Y, X = src.shape
-    effective_c_chunk = C if c_chunk is None else c_chunk
 
-    # Retrieve the source compressor in a zarr-version-agnostic way.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        src_compressor = src.compressor
-
-    # ------------------------------------------------------------------
-    # Create the temporary (pass-1) store
-    # Chunks: (t_chunk, 1, spatial_chunk, spatial_chunk)
-    # The vertical axis is kept as singleton so that each pass-1 write
-    # only needs one level's data in the buffer at a time.
-    # ------------------------------------------------------------------
-    tmp = tmp_group.create_array(
-        name,
-        shape=src.shape,
-        chunks=(t_chunk, 1, spatial_chunk, spatial_chunk),
-        dtype=src.dtype,
-        compressors=None,
-        overwrite=True,
-    )
-
-    # ------------------------------------------------------------------
-    # Create the destination (pass-2) store
-    # Chunks: (t_chunk, c_chunk, spatial_chunk, spatial_chunk)
-    # ------------------------------------------------------------------
-    dst = dst_group.create_array(
-        name,
-        shape=src.shape,
-        chunks=(t_chunk, effective_c_chunk, spatial_chunk, spatial_chunk),
-        dtype=src.dtype,
-        compressors=src_compressor,
-        overwrite=True,
-    )
-    # Preserve the source array's attributes in the rechunked output.
-    dst.attrs.update(dict(src.attrs))
+    # Access pre-allocated arrays created by _initialise_rechunk_stores.
+    tmp = tmp_group[name]
+    dst = dst_group[name]
 
     # ------------------------------------------------------------------
     # Pass 1: merge the time axis into t_chunk blocks; keep C = 1.
-    # Each buffer is (min(t_chunk, T), 1, Y, X) – one level at a time.
+    # An async pipeline overlaps reading one (t_chunk, 1, Y, X) block
+    # from *src* with writing the previous block to *tmp*.
     # ------------------------------------------------------------------
     _log.info(
         "rechunk '%s'  shape=%s  src_chunks=%s  dst_chunks=%s",
@@ -276,29 +499,26 @@ def _rechunk_array(
         dst.chunks,
     )
     t_pass1_start = time.perf_counter()
-    for t0 in range(0, T, t_chunk):
-        t1 = min(t0 + t_chunk, T)
-        tlen = t1 - t0
-        for c in range(C):
-            buf = np.empty((tlen, 1, Y, X), dtype=src.dtype)
-            for k, t in enumerate(range(t0, t1)):
-                buf[k, 0, :, :] = src[t, c, :, :]
-            tmp[t0:t1, c : c + 1, :, :] = buf
+    asyncio.run(_pass1_async(src=src, tmp=tmp, t_chunk=t_chunk, T=T, C=C, Y=Y, X=X))
     t_pass1 = time.perf_counter() - t_pass1_start
 
     # ------------------------------------------------------------------
-    # Pass 2: merge the vertical axis; keep spatial tiles.
-    # Each buffer is (min(t_chunk, T), C, spatial_chunk, spatial_chunk).
+    # Pass 2: merge the vertical axis; tile spatially.
+    # An async pipeline overlaps reading one spatial tile from *tmp*
+    # with writing the previous tile to *dst*.
     # ------------------------------------------------------------------
     t_pass2_start = time.perf_counter()
-    for t0 in range(0, T, t_chunk):
-        t1 = min(t0 + t_chunk, T)
-        for y0 in range(0, Y, spatial_chunk):
-            y1 = min(y0 + spatial_chunk, Y)
-            for x0 in range(0, X, spatial_chunk):
-                x1 = min(x0 + spatial_chunk, X)
-                buf = tmp[t0:t1, :, y0:y1, x0:x1]
-                dst[t0:t1, :, y0:y1, x0:x1] = buf
+    asyncio.run(
+        _pass2_async(
+            tmp=tmp,
+            dst=dst,
+            t_chunk=t_chunk,
+            spatial_chunk=spatial_chunk,
+            T=T,
+            Y=Y,
+            X=X,
+        )
+    )
     t_pass2 = time.perf_counter() - t_pass2_start
 
     _log.info(
@@ -311,18 +531,22 @@ def _rechunk_array(
 
 
 def _rechunk_variable_worker(task_args: tuple) -> str:
-    """Rechunk (or copy) a single variable; suitable for use with :class:`multiprocessing.Pool`.
+    """Rechunk a single 4-D variable; suitable for use with :class:`multiprocessing.Pool`.
 
     This is a module-level function so that it can be pickled by
     :mod:`multiprocessing`.  It opens the source, temporary and destination
     Zarr stores by path (zarr objects are **not** passed across process
     boundaries).
 
+    All destination and temporary arrays must already be pre-allocated by
+    :func:`_initialise_rechunk_stores` so the stores can be opened in
+    ``"r+"`` mode, writing chunks straight from the read/merge buffers.
+
     Parameters
     ----------
     task_args:
-        An 8-tuple of
-        ``(name, src_path, tmp_path, dst_path, t_chunk, c_chunk,
+        A 7-tuple of
+        ``(name, src_path, tmp_path, dst_path, t_chunk,
         spatial_chunk, cleanup_tmp)``.
 
     Returns
@@ -336,29 +560,24 @@ def _rechunk_variable_worker(task_args: tuple) -> str:
         tmp_path,
         dst_path,
         t_chunk,
-        c_chunk,
         spatial_chunk,
         cleanup_tmp,
     ) = task_args
 
     src_group = zarr.open_group(open_store(src_path), mode="r", zarr_format=2)
     src = src_group[name]
-    dst_group = zarr.open_group(open_store(dst_path), mode="a", zarr_format=2)
 
-    if src.ndim != 4:
-        # Copy coordinate and auxiliary arrays (e.g. time, level, y, x)
-        # verbatim – same chunks, same compressor, same attributes.
-        _copy_array(name=name, src=src, dst_group=dst_group)
-        return name
+    # Arrays are pre-created by _initialise_rechunk_stores; open with "r+" to
+    # write chunks straight from the read/merge buffers to the store.
+    dst_group = zarr.open_group(open_store(dst_path), mode="r+", zarr_format=2)
+    tmp_group = zarr.open_group(open_store(tmp_path), mode="r+", zarr_format=2)
 
-    tmp_group = zarr.open_group(open_store(tmp_path), mode="a", zarr_format=2)
     _rechunk_array(
         name=name,
         src=src,
         tmp_group=tmp_group,
         dst_group=dst_group,
         t_chunk=t_chunk,
-        c_chunk=c_chunk,
         spatial_chunk=spatial_chunk,
     )
     # Delete this variable's temp data as soon as Pass 2 is done so
