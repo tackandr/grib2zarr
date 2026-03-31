@@ -38,6 +38,8 @@ from eccodes import (
 from config_parser import build_dataset, load_config, _eval_values
 from s3_store import open_store
 
+_DBG = logging.DEBUG  # local alias avoids repeated attribute lookup in hot paths
+
 # Default output path
 DEFAULT_ZARR_PATH = "myfile.zarr"
 
@@ -108,7 +110,7 @@ def _build_var_matcher(config: dict) -> list:
     return matchers
 
 
-def _find_level_index(level: int, msg_keys: dict, dims: list):
+def _find_level_index(level: int, msg_keys: dict, dims: list, _coord_cache: dict):
     """Return the index of *level* within the matching vertical coordinate.
 
     Searches *dims* for a dimension whose ``grib2`` keys all match the
@@ -127,6 +129,10 @@ def _find_level_index(level: int, msg_keys: dict, dims: list):
         Dict of GRIB key/value pairs already fetched from the current message.
     dims:
         List of dimension reference dicts from the variable configuration.
+    _coord_cache:
+        Mutable dict used to cache evaluated coordinate lists so that
+        ``_eval_values`` is not called more than once per unique *dim_ref*
+        object.  Pass the same dict across all calls to share the cache.
 
     Returns
     -------
@@ -142,7 +148,10 @@ def _find_level_index(level: int, msg_keys: dict, dims: list):
             continue
         # All grib2 keys declared for this dim must match the current message
         if all(msg_keys.get(k) == v for k, v in grib2.items()):
-            coord_values = _eval_values(dim_ref.get("values", []))
+            dim_id = id(dim_ref)
+            if dim_id not in _coord_cache:
+                _coord_cache[dim_id] = _eval_values(dim_ref.get("values", []))
+            coord_values = _coord_cache[dim_id]
             if level in coord_values:
                 return coord_values.index(level)
             # Level is outside the configured coordinate range → skip message
@@ -150,7 +159,7 @@ def _find_level_index(level: int, msg_keys: dict, dims: list):
     return None
 
 
-def _find_time_index(msg_keys: dict, dims: list):
+def _find_time_index(msg_keys: dict, dims: list, _coord_cache: dict):
     """Return the time-dimension index for the current GRIB2 message.
 
     Searches *dims* for a dimension that carries a ``reference_time`` field
@@ -169,6 +178,10 @@ def _find_time_index(msg_keys: dict, dims: list):
         Dict of GRIB key/value pairs already fetched from the current message.
     dims:
         List of dimension reference dicts from the variable configuration.
+    _coord_cache:
+        Mutable dict used to cache evaluated step-value lists so that
+        ``_eval_values`` is not called more than once per unique *dim_ref*
+        object.  Pass the same dict across all calls to share the cache.
 
     Returns
     -------
@@ -197,7 +210,10 @@ def _find_time_index(msg_keys: dict, dims: list):
             validity_time % 100,
         )
         delta_hours = (valid_dt - ref_dt).total_seconds() / _SECONDS_PER_HOUR
-        step_values = _eval_values(dim_ref.get("values", []))
+        dim_id = id(dim_ref)
+        if dim_id not in _coord_cache:
+            _coord_cache[dim_id] = _eval_values(dim_ref.get("values", []))
+        step_values = _coord_cache[dim_id]
         for idx, sv in enumerate(step_values):
             if abs(float(sv) - delta_hours) < _TIME_MATCH_TOLERANCE_HOURS:
                 return idx
@@ -254,16 +270,33 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
             if isinstance(dim_ref, dict):
                 keys_needed.update(dim_ref.get("grib2", {}).keys())
 
+    _log.debug(
+        "read_grib  matchers=%d  keys_needed=%d  keys=%s",
+        len(matchers),
+        len(keys_needed),
+        sorted(keys_needed),
+    )
+
+    # Shared cache for coordinate value lists across all calls to
+    # _find_level_index and _find_time_index.  Keyed by id(dim_ref) so that
+    # the same dim_ref dict is only evaluated once, regardless of how many
+    # messages reference it.
+    _coord_cache: dict = {}
+
     for grib_file_path in grib_file_paths:
         _log.info("extract  file='%s'  scanning …", grib_file_path)
         t_file_start = time.perf_counter()
         matched_count = 0
+        scanned_count = 0
+        # Per-variable match counters for DEBUG diagnostics.
+        _var_match_counts: dict = {m[0]: 0 for m in matchers}
         with open(grib_file_path, "rb") as f:
             while True:
                 gid = codes_grib_new_from_file(f)
                 if gid is None:
                     break
 
+                scanned_count += 1
                 level = codes_get(gid, "level", ktype=int)
 
                 # Fetch all keys required for matching in one pass.
@@ -290,12 +323,13 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
 
                 if matched is not None:
                     var_name, dims = matched
-                    z_idx = _find_level_index(level, msg_keys, dims)
-                    t_idx = _find_time_index(msg_keys, dims)
+                    z_idx = _find_level_index(level, msg_keys, dims, _coord_cache)
+                    t_idx = _find_time_index(msg_keys, dims, _coord_cache)
                     if z_idx is not None and t_idx is not None:
                         values = codes_get_values(gid)
                         codes_release(gid)
                         matched_count += 1
+                        _var_match_counts[var_name] += 1
                         yield (var_name, t_idx, z_idx, values)
                     else:
                         codes_release(gid)
@@ -307,11 +341,20 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
                 await asyncio.sleep(0)
         t_file_elapsed = time.perf_counter() - t_file_start
         _log.info(
-            "extract  file='%s'  matched=%d  elapsed=%.1fs",
+            "extract  file='%s'  scanned=%d  matched=%d  elapsed=%.1fs",
             grib_file_path,
+            scanned_count,
             matched_count,
             t_file_elapsed,
         )
+        if _log.isEnabledFor(_DBG):
+            for vname, cnt in _var_match_counts.items():
+                _log.debug(
+                    "extract  file='%s'  var='%s'  matched=%d",
+                    grib_file_path,
+                    vname,
+                    cnt,
+                )
 
 
 async def write_slice(
@@ -320,7 +363,7 @@ async def write_slice(
     t_idx: int,
     z_idx: int,
     values,
-    zarr_path: str,
+    store: zarr.Group,
 ) -> None:
     """Write a single level slice for a variable into the Zarr store.
 
@@ -342,8 +385,10 @@ async def write_slice(
         Index along the vertical dimension.
     values:
         Flat numpy array of grid values for this message.
-    zarr_path:
-        Path of the Zarr store to update.
+    store:
+        Already-open Zarr group for the output store.  Opening the store
+        once in the caller and reusing it here avoids per-slice filesystem
+        overhead that becomes significant with many variables.
     """
     da_var = ds[var_name]
     dim_names = list(da_var.dims)
@@ -368,12 +413,19 @@ async def write_slice(
         else:
             np_idx.append(z_idx)
 
-    # Write directly to the Zarr store.  The dataset data variables are
-    # backed by lazy dask arrays, so modifying ``ds[var_name].values`` only
-    # updates a temporary computed copy and never persists.  Opening the store
-    # with zarr and indexing directly avoids that problem.
-    store = zarr.open(open_store(zarr_path), mode="r+")
+    # Write directly to the Zarr store using the caller-supplied open group.
+    # Reusing a single open store across all slice writes avoids the repeated
+    # filesystem metadata reads that zarr.open() performs on every call,
+    # which is the dominant IO cost when many variables are present.
+    t_write_start = time.perf_counter()
     store[var_name][tuple(np_idx)] = grid
+    _log.debug(
+        "write_slice  var='%s'  t_idx=%d  z_idx=%d  elapsed=%.4fs",
+        var_name,
+        t_idx,
+        z_idx,
+        time.perf_counter() - t_write_start,
+    )
 
 
 async def producer(
@@ -407,6 +459,12 @@ async def consumer(
 ) -> None:
     """Consume messages from *queue* and write them to the Zarr store.
 
+    The Zarr store is opened **once** at the start and reused for every
+    slice write.  Re-opening the store on each write was the dominant IO
+    bottleneck when many variables are present: with N variables ×
+    T timesteps × C levels the repeated metadata reads scaled linearly with
+    the total number of slices written.
+
     Parameters
     ----------
     queue:
@@ -416,14 +474,43 @@ async def consumer(
     zarr_path:
         Path of the Zarr store to update.
     """
+    # Open the Zarr store once and reuse it for all writes.
+    _t_open = time.perf_counter()
+    store = zarr.open(open_store(zarr_path), mode="r+")
+    _log.debug(
+        "consumer  store_open  path='%s'  elapsed=%.4fs",
+        zarr_path,
+        time.perf_counter() - _t_open,
+    )
+
+    _write_count = 0
+    _t_write_total = 0.0
+    # Per-variable write counters for DEBUG diagnostics.
+    _var_write_counts: dict = {}
+
     while True:
         message = await queue.get()
         if message is None:
             queue.task_done()
             break
         var_name, t_idx, z_idx, values = message
-        await write_slice(ds, var_name, t_idx, z_idx, values, zarr_path)
+        _t0 = time.perf_counter()
+        await write_slice(ds, var_name, t_idx, z_idx, values, store)
+        _elapsed = time.perf_counter() - _t0
+        _write_count += 1
+        _t_write_total += _elapsed
+        _var_write_counts[var_name] = _var_write_counts.get(var_name, 0) + 1
         queue.task_done()
+
+    _log.debug(
+        "consumer  done  writes=%d  write_time=%.1fs  avg_write=%.4fs",
+        _write_count,
+        _t_write_total,
+        _t_write_total / max(_write_count, 1),
+    )
+    if _log.isEnabledFor(_DBG):
+        for vname, cnt in sorted(_var_write_counts.items()):
+            _log.debug("consumer  var='%s'  writes=%d", vname, cnt)
 
 
 async def main(
@@ -512,13 +599,28 @@ def _parse_args(argv=None):
         default=False,
         help="Enable INFO-level logging (shows progress, timing, etc.).",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable DEBUG-level logging (shows per-slice write timings, "
+            "per-variable match counts and IO diagnostics). Implies --verbose."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def cli() -> None:
     """Console-script entry point installed by ``pip install``."""
     args = _parse_args(sys.argv[1:])
-    if args.verbose:
+    if args.debug:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    elif args.verbose:
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(message)s",
