@@ -51,7 +51,6 @@ import time
 import warnings
 from typing import Optional
 
-import numpy as np
 import zarr
 
 from s3_store import open_store
@@ -219,22 +218,17 @@ def _rechunk_array(
     )
 
     # ------------------------------------------------------------------
-    # Single pass: for each (time_block, level_block) read all source
-    # chunks into a contiguous in-memory buffer of shape
-    # (tlen, clen, Y, X), then write to destination in spatial tiles so
+    # Single pass: for each (time_block, level_block) read the entire
+    # slab into a contiguous in-memory buffer of shape (tlen, clen, Y, X)
+    # in one zarr call, then write to the destination in spatial tiles so
     # each destination chunk is written exactly once.
     # ------------------------------------------------------------------
     t_start = time.perf_counter()
     for t0 in range(0, T, t_chunk):
         t1 = min(t0 + t_chunk, T)
-        tlen = t1 - t0
         for c0 in range(0, C, effective_c_chunk):
             c1 = min(c0 + effective_c_chunk, C)
-            clen = c1 - c0
-            buf = np.empty((tlen, clen, Y, X), dtype=src.dtype)
-            for k, t in enumerate(range(t0, t1)):
-                for ci, c in enumerate(range(c0, c1)):
-                    buf[k, ci, :, :] = src[t, c, :, :]
+            buf = src[t0:t1, c0:c1, :, :]
             for y0 in range(0, Y, spatial_chunk):
                 y1 = min(y0 + spatial_chunk, Y)
                 for x0 in range(0, X, spatial_chunk):
