@@ -26,10 +26,12 @@ import time
 from datetime import datetime
 from typing import List, Union
 
+import numpy as np
 import xarray as xr
 import zarr
 from eccodes import (
     codes_get,
+    codes_get_array,
     codes_get_values,
     codes_grib_new_from_file,
     codes_release,
@@ -294,6 +296,9 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
                     t_idx = _find_time_index(msg_keys, dims)
                     if z_idx is not None and t_idx is not None:
                         values = codes_get_values(gid)
+                        if codes_get(gid, "bitmapPresent"):
+                            bitmap = np.array(codes_get_array(gid, "bitmap"), dtype=bool)
+                            values[~bitmap] = np.nan
                         codes_release(gid)
                         matched_count += 1
                         yield (var_name, t_idx, z_idx, values)
