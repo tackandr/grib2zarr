@@ -234,29 +234,30 @@ def build_dataset(config: dict) -> xr.Dataset:
             # the geometry references both a Y- and an X-axis coordinate.
             if crs_attrs:
                 x_name = y_name = None
-                for coord_ref in info.get("cf", {}).get("coords", []):
+                geom_cf = info.get("cf", {})
+                for coord_ref in geom_cf.get("coords", []):
                     if not isinstance(coord_ref, dict):
                         continue
-                    axis = coord_ref.get("cf", {}).get("axis", "")
+                    coord_cf_attrs = coord_ref.get("cf", {})
+                    axis = coord_cf_attrs.get("axis", "")
                     cname = coord_ref.get("name", "")
                     if axis == "X":
                         x_name = cname
                     elif axis == "Y":
                         y_name = cname
-                if (
-                    x_name and y_name
-                    and x_name in coords
-                    and y_name in coords
-                ):
-                    lat_var, lon_var = _build_latlon_from_crs(
-                        crs_attrs,
-                        x_name,
-                        y_name,
-                        coords[x_name].values,
-                        coords[y_name].values,
-                    )
-                    coords["latitude"] = lat_var
-                    coords["longitude"] = lon_var
+                if x_name and y_name and x_name in coords and y_name in coords:
+                    x_vals = coords[x_name].values
+                    y_vals = coords[y_name].values
+                    if x_vals.ndim == 1 and y_vals.ndim == 1:
+                        lat_var, lon_var = _build_latlon_from_crs(
+                            crs_attrs,
+                            x_name,
+                            y_name,
+                            x_vals,
+                            y_vals,
+                        )
+                        coords["latitude"] = lat_var
+                        coords["longitude"] = lon_var
 
     # ------------------------------------------------------------------
     # Data variables
