@@ -134,7 +134,7 @@ def build_dataset(config: dict) -> xr.Dataset:
                 step_vals = _eval_values(info["values"])
                 values = _build_datetime_values(ref_time, step_vals)
             else:
-                values = np.array(_eval_values(info["values"]))
+                values = np.array(_eval_values(info["values"]), dtype=float)
             cf_attrs = dict(info.get("cf", {}))
             if ref_time is not None:
                 # xarray manages the ``units`` encoding for datetime64 arrays
