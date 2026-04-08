@@ -136,7 +136,7 @@ def _build_latlon_from_crs(
     dims = (y_name, x_name)
     lat_var = xr.Variable(
         dims,
-        lat.astype(np.float64),
+        lat,
         attrs={
             "standard_name": "latitude",
             "long_name": "latitude",
@@ -145,7 +145,7 @@ def _build_latlon_from_crs(
     )
     lon_var = xr.Variable(
         dims,
-        lon.astype(np.float64),
+        lon,
         attrs={
             "standard_name": "longitude",
             "long_name": "longitude",
@@ -256,8 +256,10 @@ def build_dataset(config: dict) -> xr.Dataset:
                             x_vals,
                             y_vals,
                         )
-                        coords["latitude"] = lat_var
-                        coords["longitude"] = lon_var
+                        if "latitude" not in coords:
+                            coords["latitude"] = lat_var
+                        if "longitude" not in coords:
+                            coords["longitude"] = lon_var
 
     # ------------------------------------------------------------------
     # Data variables
