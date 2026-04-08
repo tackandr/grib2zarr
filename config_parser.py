@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import pyproj
 import yaml
 import numpy as np
 import xarray as xr
@@ -94,6 +95,66 @@ def _build_datetime_values(reference_time: str, step_values: list) -> np.ndarray
     return np.array(dt_values, dtype="datetime64[ns]")
 
 
+def _build_latlon_from_crs(
+    crs_attrs: dict,
+    x_name: str,
+    y_name: str,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+) -> tuple[xr.Variable, xr.Variable]:
+    """Compute 2-D latitude/longitude arrays from projected x/y coordinates.
+
+    Uses the CF-convention CRS attributes (as stored on the grid-mapping
+    variable) to build a :class:`pyproj.Transformer` from the projected
+    coordinate system to WGS 84 geographic coordinates, then evaluates the
+    full ``(ny, nx)`` meshgrid.
+
+    Parameters
+    ----------
+    crs_attrs:
+        CF grid-mapping attributes dict (e.g. produced by
+        ``config["geometries"][…]["cf"]["crs"]``).
+    x_name:
+        Name of the x (``projection_x_coordinate``) dimension.
+    y_name:
+        Name of the y (``projection_y_coordinate``) dimension.
+    x_values:
+        1-D array of x coordinate values in the projected CRS (metres).
+    y_values:
+        1-D array of y coordinate values in the projected CRS (metres).
+
+    Returns
+    -------
+    tuple[xr.Variable, xr.Variable]
+        2-D ``(y_name, x_name)`` *latitude* and *longitude* variables
+        with CF-standard attributes.
+    """
+    crs = pyproj.CRS.from_cf(crs_attrs)
+    transformer = pyproj.Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+    xx, yy = np.meshgrid(x_values, y_values)
+    lon, lat = transformer.transform(xx, yy)
+    dims = (y_name, x_name)
+    lat_var = xr.Variable(
+        dims,
+        lat.astype(np.float64),
+        attrs={
+            "standard_name": "latitude",
+            "long_name": "latitude",
+            "units": "degrees_north",
+        },
+    )
+    lon_var = xr.Variable(
+        dims,
+        lon.astype(np.float64),
+        attrs={
+            "standard_name": "longitude",
+            "long_name": "longitude",
+            "units": "degrees_east",
+        },
+    )
+    return lat_var, lon_var
+
+
 def build_dataset(config: dict) -> xr.Dataset:
     """Build an empty xarray Dataset from a parsed YAML configuration.
 
@@ -105,7 +166,10 @@ def build_dataset(config: dict) -> xr.Dataset:
       non-index coordinates.
     * **Grid-mapping variables** – one scalar integer variable per entry in
       ``config['geometries']``, carrying CRS metadata as attributes following
-      the CF grid_mapping convention.
+      the CF grid_mapping convention.  If the geometry references spatial
+      coordinate axes (``axis: Y`` and ``axis: X``), 2-D ``latitude`` and
+      ``longitude`` coordinate variables are also added (derived via
+      :func:`_build_latlon_from_crs`).
     * **Data variables** – one per entry in ``config['variables']``, backed
       by a lazy :mod:`dask` array of the correct shape and chunk layout
       derived from the dimension references in the configuration.
@@ -165,6 +229,34 @@ def build_dataset(config: dict) -> xr.Dataset:
             crs_attrs = dict(info.get("cf", {}).get("crs", {}))
             # Scalar integer variable – standard CF grid_mapping convention
             data_vars[geom_name] = xr.Variable((), np.int32(0), attrs=crs_attrs)
+
+            # Derive 2-D latitude/longitude from the projected x/y axes when
+            # the geometry references both a Y- and an X-axis coordinate.
+            if crs_attrs:
+                x_name = y_name = None
+                for coord_ref in info.get("cf", {}).get("coords", []):
+                    if not isinstance(coord_ref, dict):
+                        continue
+                    axis = coord_ref.get("cf", {}).get("axis", "")
+                    cname = coord_ref.get("name", "")
+                    if axis == "X":
+                        x_name = cname
+                    elif axis == "Y":
+                        y_name = cname
+                if (
+                    x_name and y_name
+                    and x_name in coords
+                    and y_name in coords
+                ):
+                    lat_var, lon_var = _build_latlon_from_crs(
+                        crs_attrs,
+                        x_name,
+                        y_name,
+                        coords[x_name].values,
+                        coords[y_name].values,
+                    )
+                    coords["latitude"] = lat_var
+                    coords["longitude"] = lon_var
 
     # ------------------------------------------------------------------
     # Data variables
