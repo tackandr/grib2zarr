@@ -69,7 +69,18 @@ def initialise_zarr(zarr_path: str, config: dict) -> xr.Dataset:
         The in-memory dataset whose Zarr store was just initialised.
     """
     ds = build_dataset(config)
-    ds.to_zarr(open_store(zarr_path), mode="w", zarr_format=2, compute=False)
+    # For datetime64 coordinates xarray encodes to int64 with CF units.
+    # zarr v2 defaults to fill_value=0 for int64, so any time step whose
+    # encoded value is 0 (e.g. step 0 = reference time when units are
+    # "hours since <reference_time>") would be masked as NaT on read-back.
+    # Use the largest int64 value as fill_value instead – it is far outside
+    # any realistic meteorological time range.
+    encoding = {
+        name: {"_FillValue": np.iinfo(np.int64).max}
+        for name, coord in ds.coords.items()
+        if np.issubdtype(coord.dtype, np.datetime64)
+    }
+    ds.to_zarr(open_store(zarr_path), mode="w", zarr_format=2, compute=False, encoding=encoding)
     return ds
 
 
