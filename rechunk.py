@@ -143,6 +143,7 @@ def _copy_array(name: str, src: zarr.Array, dst_group: zarr.Group) -> None:
         chunks=src.chunks,
         dtype=src.dtype,
         compressors=src_compressor,
+        fill_value=src.fill_value,
         overwrite=True,
     )
     # Use Ellipsis indexing so that 0-D (scalar) arrays are handled correctly.
@@ -204,6 +205,7 @@ def _rechunk_array(
         chunks=(t_chunk, effective_c_chunk, spatial_chunk, spatial_chunk),
         dtype=src.dtype,
         compressors=src_compressor,
+        fill_value=src.fill_value,
         overwrite=True,
     )
     # Preserve the source array's attributes in the rechunked output.
