@@ -69,17 +69,20 @@ def initialise_zarr(zarr_path: str, config: dict) -> xr.Dataset:
         The in-memory dataset whose Zarr store was just initialised.
     """
     ds = build_dataset(config)
-    # For datetime64 coordinates xarray encodes to int64 with CF units.
-    # zarr v2 defaults to fill_value=0 for int64, so any time step whose
-    # encoded value is 0 (e.g. step 0 = reference time when units are
-    # "hours since <reference_time>") would be masked as NaT on read-back.
-    # Use the largest int64 value as fill_value instead – it is far outside
-    # any realistic meteorological time range.
-    encoding = {
-        name: {"_FillValue": np.iinfo(np.int64).max}
-        for name, coord in ds.coords.items()
-        if np.issubdtype(coord.dtype, np.int64)
-    }
+    # zarr v2 defaults to fill_value=0 / 0.0 for numeric arrays.  xarray
+    # masks values equal to _FillValue as NaN/NaT when reading back with CF
+    # decoding, so any coordinate whose first value is 0 (e.g. x[0]=0,
+    # time step 0 = reference time encoded as int64 0) would become NaN/NaT.
+    #
+    # Fix: explicitly set _FillValue in the zarr encoding for every coordinate:
+    #   • datetime64 → xarray encodes as int64; use INT64_MAX as sentinel.
+    #   • float64    → use NaN so that 0.0 is never treated as missing.
+    encoding: dict = {}
+    for name, coord in ds.coords.items():
+        if np.issubdtype(coord.dtype, np.datetime64):
+            encoding[name] = {"_FillValue": np.iinfo(np.int64).max}
+        elif np.issubdtype(coord.dtype, np.floating):
+            encoding[name] = {"_FillValue": np.nan}
     ds.to_zarr(open_store(zarr_path), mode="w", zarr_format=2, compute=False, encoding=encoding)
     return ds
 
