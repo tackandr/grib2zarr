@@ -78,7 +78,7 @@ def initialise_zarr(zarr_path: str, config: dict) -> xr.Dataset:
     encoding = {
         name: {"_FillValue": np.iinfo(np.int64).max}
         for name, coord in ds.coords.items()
-        if np.issubdtype(coord.dtype, np.datetime64)
+        if np.issubdtype(coord.dtype, np.int64)
     }
     ds.to_zarr(open_store(zarr_path), mode="w", zarr_format=2, compute=False, encoding=encoding)
     return ds
