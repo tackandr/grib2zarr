@@ -90,14 +90,21 @@ def initialise_zarr(zarr_path: str, config: dict) -> xr.Dataset:
 def _build_var_matcher(config: dict) -> list:
     """Build a list of variable matchers from a parsed config.
 
-    Each entry is a tuple ``(var_name, grib2_keys, dims)`` where *grib2_keys*
-    is a dict of the combined GRIB2 identification keys for that variable —
-    its own discipline/parameterCategory/parameterNumber keys **plus** any
-    ``grib2`` keys declared on its dimension references (e.g.
+    Each entry is a tuple ``(var_name, grib2_keys, dims, valid_levels)`` where
+    *grib2_keys* is a dict of the combined GRIB2 identification keys for that
+    variable — its own discipline/parameterCategory/parameterNumber keys
+    **plus** any ``grib2`` keys declared on its dimension references (e.g.
     ``typeOfFirstFixedSurface`` from the vertical coordinate).  Including the
     vertical-coordinate keys ensures that two variables sharing the same
     parameter numbers but placed on different level types (e.g. hybrid-sigma
     vs. height-above-ground) are matched uniquely.
+
+    *valid_levels* is the set of GRIB ``level`` values that are valid for the
+    variable's vertical dimension (derived from that dimension's ``values``
+    list).  When two variables share all ``grib2`` keys but differ only by
+    level value (e.g. temperature at height 0 m vs. 2 m), this set is used
+    to disambiguate them during matching.  ``None`` means no level-based
+    filtering is applied (e.g. for variables with no vertical dimension).
 
     Parameters
     ----------
@@ -106,21 +113,28 @@ def _build_var_matcher(config: dict) -> list:
 
     Returns
     -------
-    list of (str, dict, list)
+    list of (str, dict, list, set or None)
     """
     matchers = []
     for var in config.get("variables", []):
         var_name = var["name"]
         grib2_keys = dict(var.get("grib2", {}))
         dims = var.get("dims", [])
+        valid_levels = None
         # Merge grib2 keys from dimension references so that level-type keys
         # (e.g. typeOfFirstFixedSurface) become part of the variable match.
+        # Also collect the valid level values from the vertical dimension so
+        # that variables with the same level-type key but different level
+        # values (e.g. height0=0 m vs. height2=2 m) can be distinguished.
         for dim_ref in dims:
             if isinstance(dim_ref, dict):
                 dim_grib2 = dim_ref.get("grib2", {})
                 if dim_grib2:
                     grib2_keys.update(dim_grib2)
-        matchers.append((var_name, grib2_keys, dims))
+                    coord_values = _eval_values(dim_ref.get("values", []))
+                    if coord_values:
+                        valid_levels = set(coord_values)
+        matchers.append((var_name, grib2_keys, dims, valid_levels))
     return matchers
 
 
@@ -264,7 +278,7 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
     # validityDate and validityTime are always fetched to support
     # datetime-based time-index matching.
     keys_needed: set = {"validityDate", "validityTime"}
-    for _var_name, grib2_keys, dims in matchers:
+    for _var_name, grib2_keys, dims, _valid_levels in matchers:
         keys_needed.update(grib2_keys.keys())
         for dim_ref in dims:
             if isinstance(dim_ref, dict):
@@ -299,10 +313,11 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
                             pass  # Key absent in this message type
 
                 matched = None
-                for var_name, grib2_keys, dims in matchers:
+                for var_name, grib2_keys, dims, valid_levels in matchers:
                     if all(msg_keys.get(k) == v for k, v in grib2_keys.items()):
-                        matched = (var_name, dims)
-                        break
+                        if valid_levels is None or level in valid_levels:
+                            matched = (var_name, dims)
+                            break
 
                 if matched is not None:
                     var_name, dims = matched
