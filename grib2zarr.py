@@ -135,6 +135,12 @@ def _build_var_matcher(config: dict) -> list:
                     if coord_values:
                         valid_levels = set(coord_values)
         matchers.append((var_name, grib2_keys, dims, valid_levels))
+    # Sort most-specific matchers first (most grib2 keys) so that a variable
+    # whose keys are a strict superset of another's is always checked first.
+    # This prevents, e.g., a 3-key matcher from swallowing messages that
+    # belong to a 4-key matcher with the same 3 keys plus an extra one such
+    # as typeOfStatisticalProcessing.
+    matchers.sort(key=lambda m: len(m[1]), reverse=True)
     return matchers
 
 
