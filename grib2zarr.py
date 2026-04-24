@@ -82,7 +82,12 @@ def initialise_zarr(zarr_path: str, config: dict) -> xr.Dataset:
         if np.issubdtype(coord.dtype, np.datetime64):
             encoding[name] = {"_FillValue": np.iinfo(np.int64).max}
         elif np.issubdtype(coord.dtype, np.floating):
-            encoding[name] = {"_FillValue": np.nan}
+            entry: dict = {"_FillValue": np.nan}
+            # 2-D coordinate arrays (e.g. latitude, longitude) are stored as a
+            # single chunk so that the entire grid is read in one I/O request.
+            if coord.ndim == 2:
+                entry["chunks"] = coord.shape
+            encoding[name] = entry
     ds.to_zarr(open_store(zarr_path), mode="w", zarr_format=2, compute=False, encoding=encoding)
     return ds
 
