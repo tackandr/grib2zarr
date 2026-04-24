@@ -7,7 +7,7 @@ Extract parameters from a GRIB2 file and store them in a [Zarr](https://zarr.dev
 - Reads GRIB2 messages with [eccodes](https://github.com/ecmwf/eccodes-python)
 - Extracts a user-specified list of parameters and stores each as a variable in a Zarr v2 store via [xarray](https://xarray.dev/)
 - Uses an `asyncio` producer/consumer queue to decouple I/O-bound reading from writing
-- Separate **`rechunk2zarr`** CLI for optional two-pass rechunking that restructures a Zarr store into a layout optimised for time-series access without requiring the full dataset to fit in RAM
+- Separate **`rechunk2zarr`** CLI for optional single-pass rechunking that restructures a Zarr store into a layout optimised for time-series access
 - Consolidated Zarr metadata (`.zmetadata`) written automatically so tools like xarray open the store without scanning every directory
 - `--verbose` / `-v` flag for INFO-level progress and timing logs
 
@@ -86,7 +86,7 @@ grib2zarr fc2026032709+001grib2_mbr000 fc2026032709+002grib2_mbr000 \
 After extracting to a Zarr store with `grib2zarr`, use `rechunk2zarr` to rechunk it into a layout optimised for time-series access:
 
 ```bash
-rechunk2zarr SRC_PATH DST_PATH [--tmp-path TMP_PATH] [--no-cleanup] [-j N]
+rechunk2zarr SRC_PATH DST_PATH [-j N]
              [--t-chunk T] [--c-chunk C] [--spatial-chunk S] [-v]
 ```
 
@@ -94,11 +94,9 @@ rechunk2zarr SRC_PATH DST_PATH [--tmp-path TMP_PATH] [--no-cleanup] [-j N]
 |--------------------|-------------------------------------------------------------------------------------------------|--------------|
 | `SRC_PATH`         | Path to the source Zarr store (required)                                                        | —            |
 | `DST_PATH`         | Path for the rechunked output Zarr store (required)                                             | —            |
-| `--tmp-path`       | Path for the intermediate temporary store; auto-generated if not specified                      | auto         |
-| `--no-cleanup`     | Keep the temporary store after rechunking (useful for debugging)                                | off          |
 | `-j`/`--jobs`      | Number of parallel worker processes (each variable is independent)                              | `1`          |
 | `--t-chunk`        | Chunk size along the time axis                                                                  | `24`         |
-| `--c-chunk`        | Chunk size along the vertical axis (defaults to full C dimension)                               | full C       |
+| `--c-chunk`        | Chunk size along the vertical axis (defaults to full C dimension; smaller values reduce RAM)    | full C       |
 | `--spatial-chunk`  | Chunk size for both spatial axes (Y and X)                                                      | `100`        |
 | `-v`/`--verbose`   | Enable INFO-level logging (per-variable timing, progress, etc.)                                 | off          |
 
@@ -124,34 +122,27 @@ rechunk2zarr myfile.zarr myfile_rechunked.zarr --verbose
 3. **Consumer** – Picks messages off the queue and writes each level slice directly
    into the Zarr store.
 4. **Rechunk (optional)** – After writing, run `rechunk2zarr` to rechunk the store
-   into a new layout using a memory-efficient two-pass algorithm (see below).
+   into a new layout using a single-pass algorithm (see below).
 
 ## Rechunking
 
 The initial Zarr store is written with source-aligned chunks that are optimal for
 fast writing but not for downstream time-series reads.  The `rechunk2zarr` CLI
-runs a two-pass algorithm that converts the store into a layout with larger time
-blocks and spatial tiles without loading the entire dataset into memory.
+uses a single-pass algorithm that converts the store into a layout with larger time
+blocks and spatial tiles.
 
 ### Algorithm
 
-**Pass 1** – merge the time axis into `t_chunk`-sized blocks while keeping the
-vertical axis as singletons and the spatial axes tiled at `spatial_chunk`:
+For each ``(time_block, level_block)`` combination:
 
-```
-temp chunks: (t_chunk, 1, spatial_chunk, spatial_chunk)
-```
+1. Read all source chunks for that block into a contiguous in-memory buffer of shape
+   ``(tlen, clen, Y, X)`` where ``tlen ≤ t_chunk`` and ``clen ≤ c_chunk``.
+2. Write the buffer to the destination in aligned spatial tiles so that each
+   destination chunk is written exactly once.
 
-**Pass 2** – merge the vertical axis into its final size, reading from the
-temp store which is already spatially tiled:
-
-```
-final chunks: (t_chunk, c_chunk, spatial_chunk, spatial_chunk)
-```
-
-The temporary store is cleaned up variable-by-variable as each variable's
-Pass 2 completes, so peak extra disk usage equals roughly one variable's
-temp data at a time.
+Each source chunk is read exactly once.  No intermediate temporary store is written
+to disk.  Peak memory usage is proportional to ``t_chunk × c_chunk × Y × X``; use
+``--c-chunk`` to reduce it when memory is constrained.
 
 ### Defaults
 

@@ -26,10 +26,12 @@ import time
 from datetime import datetime
 from typing import List, Union
 
+import numpy as np
 import xarray as xr
 import zarr
 from eccodes import (
     codes_get,
+    codes_get_array,
     codes_get_values,
     codes_grib_new_from_file,
     codes_release,
@@ -67,21 +69,42 @@ def initialise_zarr(zarr_path: str, config: dict) -> xr.Dataset:
         The in-memory dataset whose Zarr store was just initialised.
     """
     ds = build_dataset(config)
-    ds.to_zarr(open_store(zarr_path), mode="w", zarr_format=2, compute=False)
+    # zarr v2 defaults to fill_value=0 / 0.0 for numeric arrays.  xarray
+    # masks values equal to _FillValue as NaN/NaT when reading back with CF
+    # decoding, so any coordinate whose first value is 0 (e.g. x[0]=0,
+    # time step 0 = reference time encoded as int64 0) would become NaN/NaT.
+    #
+    # Fix: explicitly set _FillValue in the zarr encoding for every coordinate:
+    #   • datetime64 → xarray encodes as int64; use INT64_MAX as sentinel.
+    #   • float64    → use NaN so that 0.0 is never treated as missing.
+    encoding: dict = {}
+    for name, coord in ds.coords.items():
+        if np.issubdtype(coord.dtype, np.datetime64):
+            encoding[name] = {"_FillValue": np.iinfo(np.int64).max}
+        elif np.issubdtype(coord.dtype, np.floating):
+            encoding[name] = {"_FillValue": np.nan}
+    ds.to_zarr(open_store(zarr_path), mode="w", zarr_format=2, compute=False, encoding=encoding)
     return ds
 
 
 def _build_var_matcher(config: dict) -> list:
     """Build a list of variable matchers from a parsed config.
 
-    Each entry is a tuple ``(var_name, grib2_keys, dims)`` where *grib2_keys*
-    is a dict of the combined GRIB2 identification keys for that variable —
-    its own discipline/parameterCategory/parameterNumber keys **plus** any
-    ``grib2`` keys declared on its dimension references (e.g.
+    Each entry is a tuple ``(var_name, grib2_keys, dims, valid_levels)`` where
+    *grib2_keys* is a dict of the combined GRIB2 identification keys for that
+    variable — its own discipline/parameterCategory/parameterNumber keys
+    **plus** any ``grib2`` keys declared on its dimension references (e.g.
     ``typeOfFirstFixedSurface`` from the vertical coordinate).  Including the
     vertical-coordinate keys ensures that two variables sharing the same
     parameter numbers but placed on different level types (e.g. hybrid-sigma
     vs. height-above-ground) are matched uniquely.
+
+    *valid_levels* is the set of GRIB ``level`` values that are valid for the
+    variable's vertical dimension (derived from that dimension's ``values``
+    list).  When two variables share all ``grib2`` keys but differ only by
+    level value (e.g. temperature at height 0 m vs. 2 m), this set is used
+    to disambiguate them during matching.  ``None`` means no level-based
+    filtering is applied (e.g. for variables with no vertical dimension).
 
     Parameters
     ----------
@@ -90,21 +113,34 @@ def _build_var_matcher(config: dict) -> list:
 
     Returns
     -------
-    list of (str, dict, list)
+    list of (str, dict, list, set or None)
     """
     matchers = []
     for var in config.get("variables", []):
         var_name = var["name"]
         grib2_keys = dict(var.get("grib2", {}))
         dims = var.get("dims", [])
+        valid_levels = None
         # Merge grib2 keys from dimension references so that level-type keys
         # (e.g. typeOfFirstFixedSurface) become part of the variable match.
+        # Also collect the valid level values from the vertical dimension so
+        # that variables with the same level-type key but different level
+        # values (e.g. height0=0 m vs. height2=2 m) can be distinguished.
         for dim_ref in dims:
             if isinstance(dim_ref, dict):
                 dim_grib2 = dim_ref.get("grib2", {})
                 if dim_grib2:
                     grib2_keys.update(dim_grib2)
-        matchers.append((var_name, grib2_keys, dims))
+                    coord_values = _eval_values(dim_ref.get("values", []))
+                    if coord_values:
+                        valid_levels = set(coord_values)
+        matchers.append((var_name, grib2_keys, dims, valid_levels))
+    # Sort most-specific matchers first (most grib2 keys) so that a variable
+    # whose keys are a strict superset of another's is always checked first.
+    # This prevents, e.g., a 3-key matcher from swallowing messages that
+    # belong to a 4-key matcher with the same 3 keys plus an extra one such
+    # as typeOfStatisticalProcessing.
+    matchers.sort(key=lambda m: len(m[1]), reverse=True)
     return matchers
 
 
@@ -248,7 +284,7 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
     # validityDate and validityTime are always fetched to support
     # datetime-based time-index matching.
     keys_needed: set = {"validityDate", "validityTime"}
-    for _var_name, grib2_keys, dims in matchers:
+    for _var_name, grib2_keys, dims, _valid_levels in matchers:
         keys_needed.update(grib2_keys.keys())
         for dim_ref in dims:
             if isinstance(dim_ref, dict):
@@ -283,10 +319,11 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
                             pass  # Key absent in this message type
 
                 matched = None
-                for var_name, grib2_keys, dims in matchers:
+                for var_name, grib2_keys, dims, valid_levels in matchers:
                     if all(msg_keys.get(k) == v for k, v in grib2_keys.items()):
-                        matched = (var_name, dims)
-                        break
+                        if valid_levels is None or level in valid_levels:
+                            matched = (var_name, dims)
+                            break
 
                 if matched is not None:
                     var_name, dims = matched
@@ -294,6 +331,9 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
                     t_idx = _find_time_index(msg_keys, dims)
                     if z_idx is not None and t_idx is not None:
                         values = codes_get_values(gid)
+                        if codes_get(gid, "bitmapPresent"):
+                            bitmap = np.array(codes_get_array(gid, "bitmap"), dtype=bool)
+                            values[~bitmap] = np.nan
                         codes_release(gid)
                         matched_count += 1
                         yield (var_name, t_idx, z_idx, values)
