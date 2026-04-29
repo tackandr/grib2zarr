@@ -337,7 +337,7 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
                     if z_idx is not None and t_idx is not None:
                         values = codes_get_values(gid)
                         if codes_get(gid, "bitmapPresent"):
-                            bitmap = np.array(codes_get_array(gid, "bitmap"), dtype=bool)
+                            bitmap = np.array(codes_get_array(gid, "bitmap",ktype=int), dtype=bool)
                             values[~bitmap] = np.nan
                         codes_release(gid)
                         matched_count += 1
