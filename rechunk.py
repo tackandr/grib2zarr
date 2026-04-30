@@ -128,10 +128,29 @@ def rechunk_zarr(
     zarr.consolidate_metadata(open_store(dst_path))
 
 
-def _copy_array(name: str, src: zarr.Array, dst_group: zarr.Group) -> None:
-    """Copy an array verbatim (data, chunks, compressor, attributes) to *dst_group*.
+def _copy_array(
+    name: str,
+    src: zarr.Array,
+    dst_group: zarr.Group,
+    chunks=None,
+) -> None:
+    """Copy an array to *dst_group*, optionally with new chunk sizes.
 
-    Used for coordinate and auxiliary arrays that do not need rechunking.
+    Used for coordinate and auxiliary arrays.  When *chunks* is ``None`` the
+    original chunk layout is preserved verbatim.  Pass an explicit tuple to
+    rechunk the array as it is copied (e.g. 2-D spatial coordinate arrays).
+
+    Parameters
+    ----------
+    name:
+        Name of the array in the destination group.
+    src:
+        Source Zarr array.
+    dst_group:
+        Zarr group for the final output.
+    chunks:
+        Chunk shape for the destination array.  ``None`` keeps the source
+        chunk layout unchanged.
     """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
@@ -140,7 +159,7 @@ def _copy_array(name: str, src: zarr.Array, dst_group: zarr.Group) -> None:
     dst = dst_group.create_array(
         name,
         shape=src.shape,
-        chunks=src.chunks,
+        chunks=src.chunks if chunks is None else chunks,
         dtype=src.dtype,
         compressors=src_compressor,
         fill_value=src.fill_value,
@@ -276,9 +295,26 @@ def _rechunk_variable_worker(task_args: tuple) -> str:
     dst_group = zarr.open_group(open_store(dst_path), mode="a", zarr_format=2)
 
     if src.ndim != 4:
-        # Copy coordinate and auxiliary arrays (e.g. time, level, y, x)
-        # verbatim – same chunks, same compressor, same attributes.
-        _copy_array(name=name, src=src, dst_group=dst_group)
+        if src.ndim == 2:
+            # Rechunk 2-D coordinate arrays (e.g. latitude, longitude) so that
+            # their spatial tile size matches the spatial_chunk of the 4-D data
+            # variables, keeping spatial access patterns aligned.
+            dst_chunks = (
+                min(spatial_chunk, src.shape[0]),
+                min(spatial_chunk, src.shape[1]),
+            )
+            _log.info(
+                "rechunk '%s'  shape=%s  src_chunks=%s  dst_chunks=%s",
+                name,
+                src.shape,
+                src.chunks,
+                dst_chunks,
+            )
+            _copy_array(name=name, src=src, dst_group=dst_group, chunks=dst_chunks)
+        else:
+            # Copy coordinate and auxiliary arrays (e.g. time, level, y, x)
+            # verbatim – same chunks, same compressor, same attributes.
+            _copy_array(name=name, src=src, dst_group=dst_group)
         return name
 
     _rechunk_array(
