@@ -164,12 +164,14 @@ def build_dataset(config: dict) -> xr.Dataset:
       attributes.  Auxiliary parameter variables (e.g. *a* and *b*
       coefficients for a hybrid sigma-pressure coordinate) are added as
       non-index coordinates.
-    * **Grid-mapping variables** – one scalar integer variable per entry in
+    * **Grid-mapping variables** – one scalar integer coordinate per entry in
       ``config['geometries']``, carrying CRS metadata as attributes following
-      the CF grid_mapping convention.  If the geometry references spatial
-      coordinate axes (``axis: Y`` and ``axis: X``), 2-D ``latitude`` and
-      ``longitude`` coordinate variables are also added (derived via
-      :func:`_build_latlon_from_crs`).
+      the CF grid_mapping convention.  Stored as a *coordinate* (not a data
+      variable) so that it is accessible at the :class:`xarray.DataArray`
+      level as well as the :class:`xarray.Dataset` level.  If the geometry
+      references spatial coordinate axes (``axis: Y`` and ``axis: X``), 2-D
+      ``latitude`` and ``longitude`` coordinate variables are also added
+      (derived via :func:`_build_latlon_from_crs`).
     * **Data variables** – one per entry in ``config['variables']``, backed
       by a lazy :mod:`dask` array of the correct shape and chunk layout
       derived from the dimension references in the configuration.
@@ -228,7 +230,8 @@ def build_dataset(config: dict) -> xr.Dataset:
             geom_name = info["name"]
             crs_attrs = dict(info.get("cf", {}).get("crs", {}))
             # Scalar integer variable – standard CF grid_mapping convention
-            data_vars[geom_name] = xr.Variable((), np.int32(0), attrs=crs_attrs)
+            # Added to coords so it is accessible at DataArray level too
+            coords[geom_name] = xr.Variable((), np.int32(0), attrs=crs_attrs)
 
             # Derive 2-D latitude/longitude from the projected x/y axes when
             # the geometry references both a Y- and an X-axis coordinate.
