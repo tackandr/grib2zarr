@@ -1,28 +1,40 @@
 """
-grib2zarr.py - Extract GRIB2 messages and store them in Zarr format using asyncio.
+grib2zarr.py - Extract GRIB2 messages and store them in Zarr format.
 
 This module reads one or more GRIB2 files, extracts parameters described by a
 YAML configuration file, and writes the data into a Zarr store.  A
-producer/consumer pattern is used with asyncio.Queue to decouple reading
-from writing.
+producer/consumer pattern is used to decouple reading from writing.
+
+Two pipelines are provided:
+
+* **Serial** (default) – a single ``asyncio`` producer/consumer, unchanged from
+  earlier versions of the tool.  Used when ``--jobs 1 --writers 1``.
+* **Parallel** – a bounded :class:`queue.Queue` with N reader threads (one per
+  input file) and M writer threads writing disjoint slabs to the Zarr store
+  concurrently.  Selected via ``--jobs`` / ``--writers`` greater than 1.
 
 Variables are identified by their GRIB2 discipline / parameterCategory /
 parameterNumber keys.  Dataset shape, chunk layout, coordinates, CRS and
 CF attributes are all derived from the configuration file.
 
 Usage:
-    python grib2zarr.py GRIB_FILE [GRIB_FILE ...] --config CONFIG [--output ZARR_PATH]
+    python grib2zarr.py GRIB_FILE [GRIB_FILE ...] --config CONFIG \\
+        [--output ZARR_PATH] [--jobs N] [--writers M]
 
 Example:
     python grib2zarr.py fc2026032709+001grib2_mbr000 fc2026032709+002grib2_mbr000 \\
-        --config config.yaml --output myfile.zarr
+        --config config.yaml --output myfile.zarr --jobs 4 --writers 4
 """
 
 import argparse
 import asyncio
+import logging
+import queue
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import List, Union
+from typing import Iterator, List, Optional, Tuple, Union
 
 import xarray as xr
 import zarr
@@ -41,6 +53,11 @@ DEFAULT_ZARR_PATH = "myfile.zarr"
 # Named constants used in time-index matching
 _SECONDS_PER_HOUR: float = 3600.0
 _TIME_MATCH_TOLERANCE_HOURS: float = 1e-6
+
+# Sentinel placed on the parallel queue to terminate writer threads.
+_STOP = object()
+
+logger = logging.getLogger(__name__)
 
 
 def initialise_zarr(zarr_path: str, config: dict) -> xr.Dataset:
@@ -202,77 +219,70 @@ def _find_time_index(msg_keys: dict, dims: list):
     return 0
 
 
-async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
-    """Async generator yielding matched GRIB messages.
+def _keys_needed_for(matchers: list) -> set:
+    """Return the union of GRIB key names required to identify a message.
 
-    Each yielded item is a tuple::
-
-        (var_name, t_idx, z_idx, values)
-
-    where *t_idx* is the zero-based index into the time coordinate (derived
-    from the message's ``validityDate``/``validityTime`` keys when the time
-    dimension carries a ``reference_time``, or ``0`` for single-step configs),
-    *z_idx* is the zero-based index into the variable's vertical coordinate,
-    and *values* is the flat numpy array of grid values.
-
-    Only messages that match at least one variable in *matchers* **and**
-    whose level **and** validity time fall within the configured coordinate
-    ranges are yielded.
-
-    GRIB key names used for matching are derived dynamically from the config:
-    all keys present in each variable's ``grib2`` dict are checked, so adding
-    extra identification keys (e.g. ``typeOfStatisticalProcessing``) to the
-    config automatically takes effect without code changes.
-
-    Parameters
-    ----------
-    grib_file_paths:
-        Path (or list of paths) to the GRIB2 file(s) to read.  When a list
-        is supplied all files are processed in order as if they were
-        concatenated.
-    matchers:
-        List produced by :func:`_build_var_matcher`.
+    Includes ``validityDate`` / ``validityTime`` (always needed for
+    datetime-based time-index matching) plus every key referenced by any
+    variable's ``grib2`` dict or by any of its dimension references.
     """
-    if isinstance(grib_file_paths, str):
-        grib_file_paths = [grib_file_paths]
-
-    # Pre-compute the union of all GRIB key names that need to be fetched.
-    # This covers both variable-identification keys (from each variable's
-    # grib2 dict) and dimension-identification keys (from each dim's grib2
-    # dict), so a single pass per message is sufficient.
-    # validityDate and validityTime are always fetched to support
-    # datetime-based time-index matching.
     keys_needed: set = {"validityDate", "validityTime"}
     for _var_name, grib2_keys, dims in matchers:
         keys_needed.update(grib2_keys.keys())
         for dim_ref in dims:
             if isinstance(dim_ref, dict):
                 keys_needed.update(dim_ref.get("grib2", {}).keys())
+    return keys_needed
 
-    for grib_file_path in grib_file_paths:
-        with open(grib_file_path, "rb") as f:
-            while True:
-                gid = codes_grib_new_from_file(f)
-                if gid is None:
-                    break
 
+def _fetch_msg_keys(gid, keys_needed: set) -> dict:
+    """Fetch every key in *keys_needed* from GRIB message *gid* in one pass.
+
+    Values are requested as ``int`` (``ktype=int``) so that coded keys such as
+    ``typeOfFirstFixedSurface`` are always returned as integers (e.g. 105)
+    rather than string abbreviations (e.g. ``'ml'``).  This ensures the values
+    match the integer constants declared in the config YAML.
+    """
+    msg_keys: dict = {}
+    for key in keys_needed:
+        try:
+            msg_keys[key] = codes_get(gid, key, ktype=int)
+        except Exception:
+            try:
+                msg_keys[key] = codes_get(gid, key)
+            except Exception:
+                pass  # Key absent in this message type
+    return msg_keys
+
+
+def _read_grib_file(
+    grib_file_path: str, matchers: list
+) -> Iterator[Tuple[str, int, int, "object"]]:
+    """Synchronously iterate matched GRIB messages in a single file.
+
+    Each yielded item is a tuple ``(var_name, t_idx, z_idx, values)`` – see
+    :func:`read_grib` for the exact semantics.  This function is the
+    thread-friendly building block used by both the async serial pipeline
+    (via :func:`read_grib`) and the parallel pipeline (executed inside a
+    :class:`~concurrent.futures.ThreadPoolExecutor` worker).
+
+    Parameters
+    ----------
+    grib_file_path:
+        Path to a single GRIB2 file.
+    matchers:
+        List produced by :func:`_build_var_matcher`.
+    """
+    keys_needed = _keys_needed_for(matchers)
+
+    with open(grib_file_path, "rb") as f:
+        while True:
+            gid = codes_grib_new_from_file(f)
+            if gid is None:
+                break
+            try:
                 level = codes_get(gid, "level", ktype=int)
-
-                # Fetch all keys required for matching in one pass.
-                # Request values as ``int`` (ktype=int) so that coded keys such as
-                # ``typeOfFirstFixedSurface`` are always returned as integers
-                # (e.g. 105) rather than string abbreviations (e.g. 'ml').
-                # This ensures the values match the integer constants declared in
-                # the config YAML.
-                msg_keys: dict = {}
-                for key in keys_needed:
-                    try:
-                        msg_keys[key] = codes_get(gid, key, ktype=int)
-                    except Exception:
-                        try:
-                            msg_keys[key] = codes_get(gid, key)
-                        except Exception:
-                            pass  # Key absent in this message type
+                msg_keys = _fetch_msg_keys(gid, keys_needed)
 
                 matched = None
                 for var_name, grib2_keys, dims in matchers:
@@ -280,22 +290,82 @@ async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
                         matched = (var_name, dims)
                         break
 
-                if matched is not None:
-                    var_name, dims = matched
-                    z_idx = _find_level_index(level, msg_keys, dims)
-                    t_idx = _find_time_index(msg_keys, dims)
-                    if z_idx is not None and t_idx is not None:
-                        values = codes_get_values(gid)
-                        codes_release(gid)
-                        yield (var_name, t_idx, z_idx, values)
-                    else:
-                        codes_release(gid)
-                else:
-                    codes_release(gid)
+                if matched is None:
+                    continue
 
-                # Yield control back to the event loop between messages so that
-                # the consumer can make progress while reading is ongoing.
-                await asyncio.sleep(0)
+                var_name, dims = matched
+                z_idx = _find_level_index(level, msg_keys, dims)
+                t_idx = _find_time_index(msg_keys, dims)
+                if z_idx is None or t_idx is None:
+                    continue
+
+                values = codes_get_values(gid)
+                yield (var_name, t_idx, z_idx, values)
+            finally:
+                codes_release(gid)
+
+
+async def read_grib(grib_file_paths: Union[str, List[str]], matchers: list):
+    """Async generator yielding matched GRIB messages.
+
+    Thin async wrapper around :func:`_read_grib_file` that iterates the files
+    serially and yields to the event loop between messages so the serial
+    consumer can make progress while reading is ongoing.
+    """
+    if isinstance(grib_file_paths, str):
+        grib_file_paths = [grib_file_paths]
+
+    for grib_file_path in grib_file_paths:
+        for item in _read_grib_file(grib_file_path, matchers):
+            yield item
+            # Cooperative yield so the consumer task can make progress.
+            await asyncio.sleep(0)
+
+
+def _compute_np_idx(ds: xr.Dataset, var_name: str, t_idx: int, z_idx: int):
+    """Return the numpy index tuple for the (t, z) slab of *var_name*.
+
+    The last two dimensions of the variable are treated as the spatial (y, x)
+    axes and are written in full; the CF ``axis: T`` dimension is written at
+    *t_idx*; any remaining non-spatial dimension is written at *z_idx*.
+    """
+    da_var = ds[var_name]
+    dim_names = list(da_var.dims)
+    spatial_dims = set(dim_names[-2:]) if len(dim_names) >= 2 else set()
+
+    np_idx = []
+    for dim in dim_names:
+        if dim in spatial_dims:
+            np_idx.append(slice(None))
+        elif dim in ds.coords and ds.coords[dim].attrs.get("axis") == "T":
+            np_idx.append(t_idx)
+        else:
+            np_idx.append(z_idx)
+    return tuple(np_idx), dim_names
+
+
+def _write_slice_sync(
+    ds: xr.Dataset,
+    store,
+    var_name: str,
+    t_idx: int,
+    z_idx: int,
+    values,
+) -> None:
+    """Write a single level slice into an already-open Zarr store.
+
+    Splitting the actual write from the store-open lets the parallel writers
+    share one :func:`zarr.open` handle instead of reopening on every message,
+    which is materially cheaper on directory stores and object stores alike.
+    """
+    da_var = ds[var_name]
+    dim_names = list(da_var.dims)
+    ny = da_var.sizes[dim_names[-2]]
+    nx = da_var.sizes[dim_names[-1]]
+    grid = values.reshape(ny, nx)
+
+    np_idx, _ = _compute_np_idx(ds, var_name, t_idx, z_idx)
+    store[var_name][np_idx] = grid
 
 
 async def write_slice(
@@ -308,109 +378,155 @@ async def write_slice(
 ) -> None:
     """Write a single level slice for a variable into the Zarr store.
 
-    The region written is determined by the variable's dimension names stored
-    in *ds*.  All spatial dimensions (y, x – the last two dims) are written in
-    full; the time dimension (identified by CF ``axis: T``) and the vertical
-    dimension are written at the indices given by *t_idx* and *z_idx*
-    respectively.
-
-    Parameters
-    ----------
-    ds:
-        In-memory dataset produced by :func:`initialise_zarr`.
-    var_name:
-        Name of the target data variable in *ds*.
-    t_idx:
-        Index along the time dimension.
-    z_idx:
-        Index along the vertical dimension.
-    values:
-        Flat numpy array of grid values for this message.
-    zarr_path:
-        Path of the Zarr store to update.
+    Retained for backward compatibility with the serial async pipeline.  The
+    parallel pipeline uses :func:`_write_slice_sync` with a shared open store
+    to avoid the per-message reopen cost.
     """
-    da_var = ds[var_name]
-    dim_names = list(da_var.dims)
-
-    # Last two dims are always the spatial (y, x) dims
-    spatial_dims = set(dim_names[-2:]) if len(dim_names) >= 2 else set()
-
-    # Reshape flat values to (ny, nx)
-    ny = da_var.sizes[dim_names[-2]]
-    nx = da_var.sizes[dim_names[-1]]
-    grid = values.reshape(ny, nx)
-
-    # Build the numpy index tuple for writing directly into the zarr array.
-    # Integer indices are used for the time and vertical dimensions so that
-    # only the single target slice is overwritten.
-    np_idx = []
-    for dim in dim_names:
-        if dim in spatial_dims:
-            np_idx.append(slice(None))
-        elif dim in ds.coords and ds.coords[dim].attrs.get("axis") == "T":
-            np_idx.append(t_idx)
-        else:
-            np_idx.append(z_idx)
-
-    # Write directly to the Zarr store.  The dataset data variables are
-    # backed by lazy dask arrays, so modifying ``ds[var_name].values`` only
-    # updates a temporary computed copy and never persists.  Opening the store
-    # with zarr and indexing directly avoids that problem.
     store = zarr.open(zarr_path, mode="r+")
-    store[var_name][tuple(np_idx)] = grid
+    _write_slice_sync(ds, store, var_name, t_idx, z_idx, values)
 
 
 async def producer(
-    queue: asyncio.Queue,
+    queue_: asyncio.Queue,
     grib_file_paths: Union[str, List[str]],
     matchers: list,
 ) -> None:
-    """Read GRIB messages and push them onto *queue*.
-
-    A sentinel value of ``None`` is placed on the queue after all messages
-    have been read to signal the consumer to stop.
-
-    Parameters
-    ----------
-    queue:
-        Shared asyncio queue.
-    grib_file_paths:
-        Path (or list of paths) to the GRIB2 file(s).
-    matchers:
-        List produced by :func:`_build_var_matcher`.
-    """
+    """Read GRIB messages and push them onto *queue_* (serial pipeline)."""
     async for message in read_grib(grib_file_paths, matchers):
-        await queue.put(message)
-    await queue.put(None)  # Sentinel – no more messages
+        await queue_.put(message)
+    await queue_.put(None)  # Sentinel – no more messages
 
 
 async def consumer(
-    queue: asyncio.Queue,
+    queue_: asyncio.Queue,
     ds: xr.Dataset,
     zarr_path: str,
 ) -> None:
-    """Consume messages from *queue* and write them to the Zarr store.
-
-    Parameters
-    ----------
-    queue:
-        Shared asyncio queue populated by :func:`producer`.
-    ds:
-        In-memory dataset used for slice-wise Zarr writes.
-    zarr_path:
-        Path of the Zarr store to update.
-    """
+    """Consume messages from *queue_* and write them (serial pipeline)."""
     while True:
-        message = await queue.get()
+        message = await queue_.get()
         if message is None:
-            queue.task_done()
+            queue_.task_done()
             break
         var_name, t_idx, z_idx, values = message
         await write_slice(ds, var_name, t_idx, z_idx, values, zarr_path)
-        queue.task_done()
+        queue_.task_done()
 
 
-async def main(grib_file_paths: Union[str, List[str]], zarr_path: str, config_path: str) -> None:
+def _check_chunk_alignment(ds: xr.Dataset, var_names: list) -> bool:
+    """Return True when every non-spatial dim of every variable has chunk=1.
+
+    When this holds, each ``(var_name, t_idx, z_idx, :, :)`` slab written by
+    the pipeline lands on a distinct Zarr chunk file, so writer threads can
+    write concurrently without racing on shared chunks.  When it does not,
+    the caller must fall back to a single writer to avoid last-writer-wins
+    on read-modify-write of shared chunks.
+    """
+    for var_name in var_names:
+        if var_name not in ds.data_vars:
+            continue
+        da_var = ds[var_name]
+        dim_names = list(da_var.dims)
+        if len(dim_names) < 2:
+            continue
+        non_spatial_dims = dim_names[:-2]
+        # ``chunks`` on a dask-backed DataArray is a tuple-per-dim of
+        # tuple-of-chunk-sizes, aligned with ``dims``.
+        chunks = da_var.chunks
+        if chunks is None:
+            continue
+        for dim, dim_chunks in zip(dim_names, chunks):
+            if dim not in non_spatial_dims:
+                continue
+            if any(cs != 1 for cs in dim_chunks):
+                return False
+    return True
+
+
+def _run_parallel(
+    ds: xr.Dataset,
+    zarr_path: str,
+    grib_file_paths: List[str],
+    matchers: list,
+    jobs: int,
+    writers: int,
+) -> None:
+    """Run the parallel reader/writer pipeline.
+
+    Spawns ``min(jobs, len(files))`` reader threads and ``writers`` writer
+    threads around a single bounded :class:`queue.Queue`.  Exceptions in any
+    worker propagate to the caller once all work has been drained.
+
+    The queue is bounded (``4 * writers``) to cap peak memory: readers block
+    once that many decoded slabs are outstanding, applying natural
+    back-pressure when writers are the bottleneck.
+    """
+    n_readers = min(jobs, len(grib_file_paths))
+    q: queue.Queue = queue.Queue(maxsize=max(4 * writers, 2 * n_readers))
+    reader_errors: List[BaseException] = []
+    writer_errors: List[BaseException] = []
+    errors_lock = threading.Lock()
+
+    def reader(path: str) -> None:
+        try:
+            for item in _read_grib_file(path, matchers):
+                q.put(item)
+        except BaseException as exc:  # noqa: BLE001 - surface all failures
+            with errors_lock:
+                reader_errors.append(exc)
+            logger.exception("Reader failed for %s", path)
+
+    def writer() -> None:
+        # Each writer opens the store once; disjoint chunk writes are safe.
+        store = zarr.open(zarr_path, mode="r+")
+        try:
+            while True:
+                item = q.get()
+                try:
+                    if item is _STOP:
+                        return
+                    var_name, t_idx, z_idx, values = item
+                    _write_slice_sync(
+                        ds, store, var_name, t_idx, z_idx, values
+                    )
+                finally:
+                    q.task_done()
+        except BaseException as exc:  # noqa: BLE001 - surface all failures
+            with errors_lock:
+                writer_errors.append(exc)
+            logger.exception("Writer failed")
+
+    with ThreadPoolExecutor(
+        max_workers=n_readers + writers,
+        thread_name_prefix="grib2zarr",
+    ) as pool:
+        writer_futures = [pool.submit(writer) for _ in range(writers)]
+        reader_futures = [
+            pool.submit(reader, path) for path in grib_file_paths
+        ]
+
+        # Wait for all readers to finish producing.
+        for f in reader_futures:
+            f.result()
+
+        # Signal writers to stop – one sentinel per writer so each one wakes.
+        for _ in range(writers):
+            q.put(_STOP)
+
+        for f in writer_futures:
+            f.result()
+
+    if reader_errors or writer_errors:
+        raise reader_errors[0] if reader_errors else writer_errors[0]
+
+
+async def main(
+    grib_file_paths: Union[str, List[str]],
+    zarr_path: str,
+    config_path: str,
+    jobs: int = 1,
+    writers: int = 1,
+) -> None:
     """Orchestrate the producer/consumer pipeline.
 
     Parameters
@@ -421,27 +537,63 @@ async def main(grib_file_paths: Union[str, List[str]], zarr_path: str, config_pa
         Destination Zarr store path.
     config_path:
         Path to the YAML configuration file describing the target dataset.
+    jobs:
+        Number of parallel reader threads.  ``1`` (default) preserves the
+        original serial ``asyncio`` pipeline.
+    writers:
+        Number of parallel writer threads.  ``1`` (default) preserves the
+        original serial ``asyncio`` pipeline.  When the config's non-spatial
+        chunk sizes are not all ``1``, this is silently capped at ``1`` to
+        avoid racing on shared chunks.
     """
     config = load_config(config_path)
     ds = initialise_zarr(zarr_path, config)
     matchers = _build_var_matcher(config)
     var_names = [m[0] for m in matchers]
 
-    queue: asyncio.Queue = asyncio.Queue()
-    producer_task = asyncio.create_task(producer(queue, grib_file_paths, matchers))
-    consumer_task = asyncio.create_task(consumer(queue, ds, zarr_path))
-
-    await asyncio.gather(producer_task)
-    await queue.join()
-    await consumer_task
-
-    if isinstance(grib_file_paths, list):
-        files_str = ", ".join(f"'{p}'" for p in grib_file_paths)
+    if isinstance(grib_file_paths, str):
+        file_list = [grib_file_paths]
     else:
-        files_str = f"'{grib_file_paths}'"
+        file_list = list(grib_file_paths)
+
+    use_parallel = (jobs > 1 or writers > 1) and len(file_list) > 0
+
+    if use_parallel and writers > 1:
+        if not _check_chunk_alignment(ds, var_names):
+            logger.warning(
+                "Non-spatial chunk sizes are not all 1; "
+                "falling back to a single writer to avoid chunk write races."
+            )
+            writers = 1
+
+    if use_parallel:
+        # The parallel pipeline is thread-based; run it off the event loop
+        # so that ``asyncio.run(main(...))`` continues to work unchanged.
+        await asyncio.to_thread(
+            _run_parallel,
+            ds,
+            zarr_path,
+            file_list,
+            matchers,
+            jobs,
+            writers,
+        )
+    else:
+        queue_: asyncio.Queue = asyncio.Queue()
+        producer_task = asyncio.create_task(
+            producer(queue_, file_list, matchers)
+        )
+        consumer_task = asyncio.create_task(consumer(queue_, ds, zarr_path))
+
+        await asyncio.gather(producer_task)
+        await queue_.join()
+        await consumer_task
+
+    files_str = ", ".join(f"'{p}'" for p in file_list)
     print(
         f"Done. Variables {', '.join(var_names)} written to '{zarr_path}' "
-        f"from {files_str} using config '{config_path}'."
+        f"from {files_str} using config '{config_path}' "
+        f"(jobs={jobs}, writers={writers})."
     )
 
 
@@ -474,15 +626,49 @@ def _parse_args(argv=None):
             "(discipline/parameterCategory/parameterNumber)."
         ),
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Number of parallel reader threads (one per input file). "
+            "Default 1 preserves the serial asyncio pipeline."
+        ),
+    )
+    parser.add_argument(
+        "--writers",
+        type=int,
+        default=None,
+        metavar="M",
+        help=(
+            "Number of parallel writer threads. Defaults to --jobs. "
+            "Silently capped at 1 when non-spatial chunk sizes are not all 1."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.jobs < 1:
+        parser.error("--jobs must be >= 1")
+    if args.writers is None:
+        args.writers = args.jobs
+    if args.writers < 1:
+        parser.error("--writers must be >= 1")
+    return args
 
 
 def cli() -> None:
     """Console-script entry point installed by ``pip install``."""
     args = _parse_args(sys.argv[1:])
-    asyncio.run(main(args.grib_files, args.zarr_path, args.config))
+    asyncio.run(
+        main(
+            args.grib_files,
+            args.zarr_path,
+            args.config,
+            jobs=args.jobs,
+            writers=args.writers,
+        )
+    )
 
 
 if __name__ == "__main__":
     cli()
-
