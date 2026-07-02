@@ -61,6 +61,7 @@ grib2zarr GRIB_FILE [GRIB_FILE ...] --config CONFIG [--output ZARR_PATH]
 | `--output`    | Destination Zarr store path                          | `myfile.zarr` |
 | `--jobs`      | Number of parallel reader threads (one per input file) | `1`         |
 | `--writers`   | Number of parallel writer threads                    | same as `--jobs` |
+| `-v`, `--verbose` | Increase log verbosity (`-v` = INFO, `-vv` = DEBUG) | warnings only |
 
 ### Example
 

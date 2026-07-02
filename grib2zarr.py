@@ -637,6 +637,16 @@ def _parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help=(
+            "Increase logging verbosity. Use -v for INFO and -vv for DEBUG "
+            "output. Without this flag only warnings and errors are shown."
+        ),
+    )
+    parser.add_argument(
         "--writers",
         type=int,
         default=None,
@@ -656,9 +666,24 @@ def _parse_args(argv=None):
     return args
 
 
+def _configure_logging(verbosity: int) -> None:
+    """Configure root logging based on the ``-v`` CLI flag count."""
+    if verbosity <= 0:
+        level = logging.WARNING
+    elif verbosity == 1:
+        level = logging.INFO
+    else:
+        level = logging.DEBUG
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
 def cli() -> None:
     """Console-script entry point installed by ``pip install``."""
     args = _parse_args(sys.argv[1:])
+    _configure_logging(args.verbose)
     asyncio.run(
         main(
             args.grib_files,
