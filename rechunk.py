@@ -216,6 +216,24 @@ def rechunk_zarr(
     zarr.consolidate_metadata(open_store(dst_path))
 
 
+def _dimension_names(src: zarr.Array):
+    """Return the dimension names for *src*, or ``None`` if unavailable.
+
+    Zarr v3 stores dimension names in dedicated array metadata; Zarr v2 stores
+    them in the ``_ARRAY_DIMENSIONS`` attribute (the xarray convention).  When
+    copying from a v2 source to a v3 destination, xarray requires
+    ``dimension_names`` to be set on the v3 array or ``xr.open_zarr`` fails
+    with a ``KeyError`` about missing ``dimension_names`` metadata.
+    """
+    src_dim_names = getattr(src.metadata, "dimension_names", None)
+    if src_dim_names:
+        return tuple(src_dim_names)
+    dims = src.attrs.get("_ARRAY_DIMENSIONS")
+    if dims is not None:
+        return tuple(dims)
+    return None
+
+
 def _copy_array(
     name: str,
     src: zarr.Array,
@@ -249,8 +267,7 @@ def _copy_array(
     dst_format = getattr(dst_group.metadata, "zarr_format", 2)
     compressors = "auto" if dst_format == 3 else src_compressor
 
-    dst = dst_group.create_array(
-        name,
+    create_kwargs = dict(
         shape=src.shape,
         chunks=src.chunks if chunks is None else chunks,
         dtype=src.dtype,
@@ -258,6 +275,11 @@ def _copy_array(
         fill_value=src.fill_value,
         overwrite=True,
     )
+    if dst_format == 3:
+        dim_names = _dimension_names(src)
+        if dim_names is not None:
+            create_kwargs["dimension_names"] = dim_names
+    dst = dst_group.create_array(name, **create_kwargs)
     # Use Ellipsis indexing so that 0-D (scalar) arrays are handled correctly.
     dst[...] = src[...]
     dst.attrs.update(dict(src.attrs))
@@ -355,6 +377,10 @@ def _rechunk_array(
     )
     if shards is not None:
         create_kwargs["shards"] = shards
+    if dst_format == 3:
+        dim_names = _dimension_names(src)
+        if dim_names is not None:
+            create_kwargs["dimension_names"] = dim_names
     dst = dst_group.create_array(name, **create_kwargs)
     # Preserve the source array's attributes in the rechunked output.
     dst.attrs.update(dict(src.attrs))

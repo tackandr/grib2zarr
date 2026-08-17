@@ -155,3 +155,25 @@ class TestRechunkZarr:
                     t_chunk=3, c_chunk=2, spatial_chunk=10,
                     zarr_format=3, spatial_shard=15,
                 )
+
+    def test_zarr_v3_output_is_readable_by_xarray(self):
+        """xarray needs ``dimension_names`` on v3 arrays; ensure it is set."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.zarr")
+            dst = os.path.join(tmp, "dst.zarr")
+            expected = _make_src(src)
+            rechunk_zarr(
+                src, dst,
+                t_chunk=3, c_chunk=2, spatial_chunk=10,
+                zarr_format=3, spatial_shard=20,
+            )
+
+            g = zarr.open_group(dst, mode="r")
+            assert g["v"].metadata.dimension_names == (
+                "time", "lev", "y", "x"
+            )
+            assert g["time"].metadata.dimension_names == ("time",)
+
+            ds = xr.open_zarr(dst)
+            assert ds["v"].dims == ("time", "lev", "y", "x")
+            np.testing.assert_array_equal(ds["v"].values, expected)
