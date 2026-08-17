@@ -91,7 +91,9 @@ After extracting to a Zarr store with `grib2zarr`, use `rechunk2zarr` to rechunk
 
 ```bash
 rechunk2zarr SRC_PATH DST_PATH [-j N]
-             [--t-chunk T] [--c-chunk C] [--spatial-chunk S] [-v]
+             [--t-chunk T] [--c-chunk C] [--spatial-chunk S]
+             [--zarr-format {2,3}]
+             [--t-shard T] [--c-shard C] [--spatial-shard S] [-v]
 ```
 
 | Argument           | Description                                                                                     | Default      |
@@ -102,6 +104,10 @@ rechunk2zarr SRC_PATH DST_PATH [-j N]
 | `--t-chunk`        | Chunk size along the time axis                                                                  | `24`         |
 | `--c-chunk`        | Chunk size along the vertical axis (defaults to full C dimension; smaller values reduce RAM)    | full C       |
 | `--spatial-chunk`  | Chunk size for both spatial axes (Y and X)                                                      | `100`        |
+| `--zarr-format`    | Zarr format version of the output store (`2` or `3`). Sharding requires `3`.                    | `2`          |
+| `--t-shard`        | Shard size along the time axis (Zarr v3 only, must be a multiple of `--t-chunk`)                | none         |
+| `--c-shard`        | Shard size along the vertical axis (Zarr v3 only, must be a multiple of `--c-chunk`)            | none         |
+| `--spatial-shard`  | Shard size for both spatial axes (Zarr v3 only, must be a multiple of `--spatial-chunk`)        | none         |
 | `-v`/`--verbose`   | Enable INFO-level logging (per-variable timing, progress, etc.)                                 | off          |
 
 ### Example with rechunking
@@ -161,6 +167,7 @@ to disk.  Peak memory usage is proportional to ``t_chunk × c_chunk × Y × X``;
 ```python
 from rechunk import rechunk_zarr
 
+# Zarr v2 output (default)
 rechunk_zarr(
     src_path="myfile.zarr",
     dst_path="myfile_rechunked.zarr",
@@ -168,7 +175,25 @@ rechunk_zarr(
     c_chunk=None,       # defaults to full C axis
     spatial_chunk=100,
 )
+
+# Zarr v3 output with per-dimension sharding
+rechunk_zarr(
+    src_path="myfile.zarr",
+    dst_path="myfile_rechunked_v3.zarr",
+    t_chunk=24,
+    c_chunk=8,
+    spatial_chunk=100,
+    zarr_format=3,
+    t_shard=48,          # optional; must be a multiple of t_chunk
+    c_shard=None,        # optional; None means one chunk per shard on this axis
+    spatial_shard=500,   # optional; must be a multiple of spatial_chunk
+)
 ```
+
+Sharding (`--*-shard` / `*_shard` arguments) requires `zarr_format=3`.  Each
+shard size must be a positive integer multiple of the corresponding chunk
+size; dimensions without an explicit shard size default to the chunk size
+(one chunk per shard along that dimension).
 
 ### Parallel pipeline
 
