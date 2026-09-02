@@ -209,6 +209,22 @@ def build_dataset(config: dict) -> xr.Dataset:
                 cf_attrs.pop("units", None)
             coords[name] = xr.Variable(name, values, attrs=cf_attrs)
 
+            # CF-compliant scalar coordinate for the forecast reference time
+            # (a.k.a. the "data time" of the forecast).  Added once per unique
+            # reference_time value.
+            if ref_time is not None and "forecast_reference_time" not in coords:
+                ref_dt_value = np.array(
+                    datetime.fromisoformat(ref_time), dtype="datetime64[ns]"
+                )
+                coords["forecast_reference_time"] = xr.Variable(
+                    (),
+                    ref_dt_value,
+                    attrs={
+                        "standard_name": "forecast_reference_time",
+                        "long_name": "forecast reference time",
+                    },
+                )
+
             # Auxiliary parameter variables (e.g. a/b for hybrid levels)
             for param in info.get("parameters", []):
                 param_name = param["name"]
