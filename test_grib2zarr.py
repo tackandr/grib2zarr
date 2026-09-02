@@ -275,3 +275,48 @@ class TestConsumer:
             np.testing.assert_array_equal(store2["myvar"][1, 2, :, :], 9.0)
             # Unwritten slice should still be -1.0
             np.testing.assert_array_equal(store2["myvar"][0, 1, :, :], -1.0)
+
+
+class TestBuildDatasetForecastReferenceTime:
+    """build_dataset should add a CF-compliant forecast_reference_time scalar coord."""
+
+    def test_scalar_forecast_reference_time_added(self):
+        config = {
+            "coordinates": [
+                {
+                    "steps": {
+                        "name": "steps",
+                        "reference_time": "2026-03-27T09:00:00",
+                        "cf": {
+                            "axis": "T",
+                            "standard_name": "time",
+                            "units": "hours since 2026-03-27 09:00:00",
+                        },
+                        "values": [1, 2, 3],
+                        "chunk": 1,
+                    }
+                }
+            ],
+        }
+        ds = config_parser.build_dataset(config)
+        assert "forecast_reference_time" in ds.coords
+        frt = ds.coords["forecast_reference_time"]
+        assert frt.dims == ()
+        assert frt.attrs.get("standard_name") == "forecast_reference_time"
+        assert frt.values == np.datetime64("2026-03-27T09:00:00", "ns")
+
+    def test_no_forecast_reference_time_without_reference_time(self):
+        config = {
+            "coordinates": [
+                {
+                    "height": {
+                        "name": "height",
+                        "cf": {"axis": "Z", "standard_name": "height", "units": "m"},
+                        "values": [0, 10, 20],
+                        "chunk": 1,
+                    }
+                }
+            ],
+        }
+        ds = config_parser.build_dataset(config)
+        assert "forecast_reference_time" not in ds.coords
