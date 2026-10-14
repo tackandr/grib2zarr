@@ -57,6 +57,83 @@ validity time map to configured coordinate values before writing. The
 configuration therefore controls both which GRIB2 messages are selected and
 how their values are represented in the output dataset.
 
+### Example configuration (`example.yaml`)
+
+This compact example follows the structure of `config.yaml`. YAML anchors let
+the variable dimensions and geometry reuse their definitions.
+
+```yaml
+coordinates:
+  - steps: &steps
+      name: steps
+      reference_time: "2026-03-27T09:00:00"
+      cf:
+        axis: T
+        standard_name: time
+      values: [1, 2, 3]
+      chunk: 1
+
+  - hybrid: &hybrid
+      name: hybrid
+      grib2:
+        typeOfFirstFixedSurface: 105
+      cf:
+        axis: Z
+        standard_name: atmosphere_hybrid_sigma_pressure_coordinate
+        positive: down
+      values: [1, 2, 3]
+      chunk: 1
+
+  - x: &x
+      name: x
+      cf:
+        axis: X
+        standard_name: projection_x_coordinate
+        units: m
+      values: [0, 2500, 5000]
+      chunk: 3
+
+  - y: &y
+      name: y
+      cf:
+        axis: Y
+        standard_name: projection_y_coordinate
+        units: m
+      values: [0, 2500, 5000]
+      chunk: 3
+
+geometries:
+  - projection: &projection
+      name: projection
+      grib2:
+        gridDefinitionTemplateNumber: 30
+      cf:
+        crs:
+          grid_mapping_name: lambert_conformal_conic
+          standard_parallel: [63.3, 63.3]
+          longitude_of_central_meridian: 15.0
+          latitude_of_projection_origin: 63.3
+        coords:
+          - *y
+          - *x
+
+variables:
+  - name: wind_speed
+    grib2:
+      discipline: 0
+      parameterCategory: 2
+      parameterNumber: 1
+    cf:
+      standard_name: wind_speed
+      units: m s-1
+    geometry: *projection
+    dims:
+      - *steps
+      - *hybrid
+      - *y
+      - *x
+```
+
 ## Rechunking flow
 
 `rechunk2zarr` is implemented in `rechunk.py`. It copies group metadata and
