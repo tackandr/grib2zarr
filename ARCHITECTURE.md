@@ -28,6 +28,35 @@ console commands.
    Zarr store for `s3://` paths. S3 credentials and an optional custom endpoint
    are obtained from environment variables; see `s3_store.py`.
 
+## YAML configuration
+
+The example configuration in `config.yaml` has three top-level sections:
+`coordinates`, `geometries`, and `variables`. Entries are YAML mappings, and
+anchors/aliases allow coordinates and geometries to be defined once and
+referenced elsewhere.
+
+- `coordinates` defines axes such as time, vertical levels, and projected
+  `x`/`y`. Each definition provides a `name` and `values`, with optional
+  `cf` attributes, `grib2` keys used to identify dimension-specific metadata,
+  and `chunk` size. Time axes can specify `reference_time`; values may be
+  literal lists or supported expression strings. A coordinate may also define
+  auxiliary `parameters`, such as hybrid-level coefficients `a` and `b`.
+- `geometries` defines grid metadata. Its `grib2` mapping contains grid
+  identification keys; `cf.crs` contains CF projection metadata; and
+  `cf.coords` references the spatial coordinate axes.
+- `variables` selects the fields to extract. Each variable has a `name`, GRIB2
+  parameter keys under `grib2` (commonly `discipline`,
+  `parameterCategory`, and `parameterNumber`), optional output attributes
+  under `cf`, and references to a `geometry` and ordered `dims`. Dimension
+  references establish the variable's shape and chunking in the output
+  dataset.
+
+For matching, the extractor combines a variable's GRIB2 keys with GRIB2 keys
+on its dimension references. It also checks that the message's level and
+validity time map to configured coordinate values before writing. The
+configuration therefore controls both which GRIB2 messages are selected and
+how their values are represented in the output dataset.
+
 ## Rechunking flow
 
 `rechunk2zarr` is implemented in `rechunk.py`. It copies group metadata and
