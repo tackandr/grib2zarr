@@ -94,6 +94,7 @@ rechunk2zarr SRC_PATH DST_PATH [-j N]
              [--t-chunk T] [--c-chunk C] [--spatial-chunk S]
              [--zarr-format {2,3}]
              [--t-shard T] [--c-shard C] [--spatial-shard S] [-v]
+             [--bitrounding BITS] [--compression-level LEVEL]
 ```
 
 | Argument           | Description                                                                                     | Default      |
@@ -108,6 +109,8 @@ rechunk2zarr SRC_PATH DST_PATH [-j N]
 | `--t-shard`        | Shard size along the time axis (Zarr v3 only, must be a multiple of `--t-chunk`)                | none         |
 | `--c-shard`        | Shard size along the vertical axis (Zarr v3 only, must be a multiple of `--c-chunk`)            | none         |
 | `--spatial-shard`  | Shard size for both spatial axes (Zarr v3 only, must be a multiple of `--spatial-chunk`)        | none         |
+| `--bitrounding`    | Number of mantissa bits to retain for rechunked data arrays; enables Zstandard compression       | none         |
+| `--compression-level` | Blosc/Zstandard compression level for rechunked data arrays (0–9)                            | source codec |
 | `-v`/`--verbose`   | Enable INFO-level logging (per-variable timing, progress, etc.)                                 | off          |
 
 ### Example with rechunking
@@ -119,6 +122,9 @@ grib2zarr fc2026032709+001grib2_mbr000 fc2026032709+002grib2_mbr000 \
 
 # Step 2 – rechunk the Zarr store
 rechunk2zarr myfile.zarr myfile_rechunked.zarr --verbose
+
+# Optional lossy bitrounding and Zstandard compression
+rechunk2zarr myfile.zarr myfile_compressed.zarr --bitrounding 12 --compression-level 5
 ```
 
 ## How it works
@@ -187,6 +193,8 @@ rechunk_zarr(
     t_shard=48,          # optional; must be a multiple of t_chunk
     c_shard=None,        # optional; None means one chunk per shard on this axis
     spatial_shard=500,   # optional; must be a multiple of spatial_chunk
+    bitrounding=12,       # optional mantissa bits to retain
+    compression_level=5,  # optional Blosc/Zstandard level (0–9)
 )
 ```
 
@@ -194,6 +202,11 @@ Sharding (`--*-shard` / `*_shard` arguments) requires `zarr_format=3`.  Each
 shard size must be a positive integer multiple of the corresponding chunk
 size; dimensions without an explicit shard size default to the chunk size
 (one chunk per shard along that dimension).
+
+Compression and bitrounding options apply to rechunked 4-D data arrays;
+coordinate and auxiliary arrays retain their source codecs.  If either option
+is set, data arrays use Zstandard compression through Blosc.  Bitrounding
+reduces precision by retaining only the requested number of mantissa bits.
 
 ### Parallel pipeline
 
@@ -210,4 +223,3 @@ To guarantee that concurrent writes never target the same Zarr chunk file,
 the pipeline verifies that every non-spatial dimension of every variable has
 `chunk: 1` in the config. If any variable has larger non-spatial chunks the
 writer count is silently capped at `1` for correctness.
-

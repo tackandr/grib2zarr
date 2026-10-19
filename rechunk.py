@@ -188,8 +188,8 @@ def rechunk_zarr(
     """
     if compression_level is not None and not 0 <= compression_level <= 9:
         raise ValueError("compression_level must be between 0 and 9.")
-    if bitrounding is not None and bitrounding <= 0:
-        raise ValueError("bitrounding must be a positive number of mantissa bits.")
+    if bitrounding is not None and bitrounding < 0:
+        raise ValueError("bitrounding must be a non-negative number of mantissa bits.")
 
     _validate_shards(
         zarr_format, t_chunk, c_chunk, spatial_chunk,
