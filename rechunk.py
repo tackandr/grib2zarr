@@ -65,6 +65,7 @@ import time
 import warnings
 from typing import Optional
 
+from numcodecs import BitRound, Blosc
 import zarr
 
 from s3_store import open_store
@@ -130,6 +131,8 @@ def rechunk_zarr(
     t_shard: Optional[int] = None,
     c_shard: Optional[int] = None,
     spatial_shard: Optional[int] = None,
+    bitrounding: Optional[int] = None,
+    compression_level: Optional[int] = None,
 ) -> None:
     """Rechunk a 4-D Zarr array via a single-pass algorithm.
 
@@ -174,7 +177,20 @@ def rechunk_zarr(
         Dimensions for which no shard size is specified default to the
         chunk size (i.e. no sharding along that dimension).  Requires
         ``zarr_format=3``.
+    bitrounding:
+        Optional number of mantissa bits to retain when bitrounding the
+        rechunked data arrays.  Enabling this also selects Zstandard
+        compression.
+    compression_level:
+        Optional Blosc/Zstandard compression level (0–9).  When set, the
+        rechunked data arrays use Zstandard compression instead of inheriting
+        the source compressor.
     """
+    if compression_level is not None and not 0 <= compression_level <= 9:
+        raise ValueError("compression_level must be between 0 and 9.")
+    if bitrounding is not None and bitrounding <= 0:
+        raise ValueError("bitrounding must be a positive number of mantissa bits.")
+
     _validate_shards(
         zarr_format, t_chunk, c_chunk, spatial_chunk,
         t_shard, c_shard, spatial_shard,
@@ -194,6 +210,7 @@ def rechunk_zarr(
             name, src_path, dst_path,
             t_chunk, c_chunk, spatial_chunk,
             zarr_format, t_shard, c_shard, spatial_shard,
+            bitrounding, compression_level,
         )
         for name in array_names
     ]
@@ -295,6 +312,8 @@ def _rechunk_array(
     t_shard: Optional[int] = None,
     c_shard: Optional[int] = None,
     spatial_shard: Optional[int] = None,
+    bitrounding: Optional[int] = None,
+    compression_level: Optional[int] = None,
 ) -> None:
     """Rechunk a single Zarr array using a single-pass algorithm.
 
@@ -317,6 +336,10 @@ def _rechunk_array(
         When any of these is provided the destination array is created as a
         Zarr v3 sharded array; dimensions without an explicit shard size
         default to the corresponding chunk size (i.e. one chunk per shard).
+    bitrounding:
+        Optional number of mantissa bits to retain in the output values.
+    compression_level:
+        Optional Blosc/Zstandard compression level (0–9).
 
     Raises
     ------
@@ -357,10 +380,24 @@ def _rechunk_array(
         warnings.simplefilter("ignore", DeprecationWarning)
         src_compressor = src.compressor
 
-    # When writing to a Zarr v3 destination, v2 numcodecs compressors cannot
-    # be passed through directly; fall back to zarr's default codecs.
     dst_format = getattr(dst_group.metadata, "zarr_format", 2)
-    compressors = "auto" if dst_format == 3 else src_compressor
+    filters = None
+    if bitrounding is not None or compression_level is not None:
+        clevel = 5 if compression_level is None else compression_level
+        if dst_format == 3:
+            compressors = [zarr.codecs.BloscCodec(cname="zstd", clevel=clevel)]
+            if bitrounding is not None:
+                filters = [zarr.codecs.BitRound(keepbits=bitrounding)]
+        else:
+            compressors = Blosc(
+                cname="zstd", clevel=clevel, shuffle=Blosc.BITSHUFFLE
+            )
+            if bitrounding is not None:
+                filters = [BitRound(keepbits=bitrounding)]
+    else:
+        # v2 numcodecs compressors cannot be passed through directly to a
+        # Zarr v3 destination; use zarr's default codecs in that case.
+        compressors = "auto" if dst_format == 3 else src_compressor
 
     # ------------------------------------------------------------------
     # Create the destination store.
@@ -375,6 +412,8 @@ def _rechunk_array(
         fill_value=src.fill_value,
         overwrite=True,
     )
+    if filters is not None:
+        create_kwargs["filters"] = filters
     if shards is not None:
         create_kwargs["shards"] = shards
     if dst_format == 3:
@@ -430,9 +469,10 @@ def _rechunk_variable_worker(task_args: tuple) -> str:
     Parameters
     ----------
     task_args:
-        A 10-tuple of
+        A 12-tuple of
         ``(name, src_path, dst_path, t_chunk, c_chunk, spatial_chunk,
-        zarr_format, t_shard, c_shard, spatial_shard)``.
+        zarr_format, t_shard, c_shard, spatial_shard, bitrounding,
+        compression_level)``.
 
     Returns
     -------
@@ -450,6 +490,8 @@ def _rechunk_variable_worker(task_args: tuple) -> str:
         t_shard,
         c_shard,
         spatial_shard,
+        bitrounding,
+        compression_level,
     ) = task_args
 
     src_group = zarr.open_group(open_store(src_path), mode="r", zarr_format=2)
@@ -491,6 +533,8 @@ def _rechunk_variable_worker(task_args: tuple) -> str:
         t_shard=t_shard,
         c_shard=c_shard,
         spatial_shard=spatial_shard,
+        bitrounding=bitrounding,
+        compression_level=compression_level,
     )
     return name
 
@@ -600,6 +644,26 @@ def _parse_rechunk_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--bitrounding",
+        type=int,
+        default=None,
+        metavar="BITS",
+        help=(
+            "Keep this many mantissa bits in rechunked data arrays and use "
+            "Zstandard compression."
+        ),
+    )
+    parser.add_argument(
+        "--compression-level",
+        type=int,
+        default=None,
+        metavar="LEVEL",
+        help=(
+            "Use Zstandard compression at a Blosc level from 0 to 9 "
+            "(default level when bitrounding is enabled: 5)."
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -629,6 +693,8 @@ def cli() -> None:
         t_shard=args.t_shard,
         c_shard=args.c_shard,
         spatial_shard=args.spatial_shard,
+        bitrounding=args.bitrounding,
+        compression_level=args.compression_level,
     )
 
 
