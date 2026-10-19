@@ -12,7 +12,7 @@ import xarray as xr
 import zarr
 import dask.array as da
 
-from rechunk import _validate_shards, rechunk_zarr
+from rechunk import _parse_rechunk_args, _validate_shards, rechunk_zarr
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +82,62 @@ class TestRechunkZarr:
             assert g.metadata.zarr_format == 2
             assert g["v"].chunks == (3, 2, 10, 10)
             np.testing.assert_array_equal(g["v"][:], expected)
+
+    @pytest.mark.parametrize("zarr_format", (2, 3))
+    def test_compression_options(self, zarr_format):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.zarr")
+            dst = os.path.join(tmp, "dst.zarr")
+            expected = _make_src(src)
+            rechunk_zarr(
+                src, dst,
+                t_chunk=3, c_chunk=2, spatial_chunk=10,
+                zarr_format=zarr_format,
+                compression_level=3,
+                bitrounding=10,
+            )
+
+            g = zarr.open_group(dst, mode="r")
+            if zarr_format == 2:
+                assert g["v"].compressor.clevel == 3
+                assert g["v"].filters[0].keepbits == 10
+            else:
+                codecs = g["v"].metadata.to_dict()["codecs"]
+                assert codecs[0]["configuration"]["keepbits"] == 10
+                assert codecs[-1]["configuration"]["clevel"] == 3
+            assert not np.array_equal(g["v"][:], expected)
+
+    @pytest.mark.parametrize("zarr_format", (2, 3))
+    def test_compression_level_without_bitrounding(self, zarr_format):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.zarr")
+            dst = os.path.join(tmp, "dst.zarr")
+            expected = _make_src(src)
+            rechunk_zarr(
+                src, dst,
+                t_chunk=3, c_chunk=2, spatial_chunk=10,
+                zarr_format=zarr_format,
+                compression_level=2,
+            )
+
+            g = zarr.open_group(dst, mode="r")
+            if zarr_format == 2:
+                assert g["v"].compressor.clevel == 2
+            else:
+                codecs = g["v"].metadata.to_dict()["codecs"]
+                assert codecs[-1]["configuration"]["clevel"] == 2
+            np.testing.assert_array_equal(g["v"][:], expected)
+
+    @pytest.mark.parametrize(
+        ("options", "message"),
+        [
+            ({"compression_level": 10}, "compression_level"),
+            ({"bitrounding": -1}, "bitrounding"),
+        ],
+    )
+    def test_invalid_compression_options_raise(self, options, message):
+        with pytest.raises(ValueError, match=message):
+            rechunk_zarr("unused-src", "unused-dst", **options)
 
     def test_zarr_v3_without_sharding(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -177,3 +233,16 @@ class TestRechunkZarr:
             ds = xr.open_zarr(dst)
             assert ds["v"].dims == ("time", "lev", "y", "x")
             np.testing.assert_array_equal(ds["v"].values, expected)
+
+
+class TestRechunkCli:
+    def test_compression_options_are_parsed(self):
+        args = _parse_rechunk_args(
+            [
+                "src.zarr", "dst.zarr",
+                "--bitrounding", "10",
+                "--compression-level", "3",
+            ]
+        )
+        assert args.bitrounding == 10
+        assert args.compression_level == 3
