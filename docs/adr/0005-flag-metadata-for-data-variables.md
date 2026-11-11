@@ -7,15 +7,15 @@
 
 ## Context
 
-[ADR 0006](0006-datasets-data-variable-metadata.md) establishes requirements for identifying the meaning and units of data variables using CF Conventions metadata.
+[ADR 0004](0004-datasets-data-variable-metadata.md) establishes requirements for identifying the meaning and units of data variables using CF Conventions metadata.
 
-Data variables may also contain flag values, such as quality control indicators, status codes, or bitwise condition flags. The meaning of these values cannot be determined reliably from the variable name or numeric values alone. ADR 0006 does not explicitly require metadata describing individual flags.
+Data variables may also contain flag values, such as quality control indicators, status codes, or bitwise condition flags. The meaning of these values cannot be determined reliably from the variable name or numeric values alone. ADR 0004 does not explicitly require metadata describing individual flags.
 
 ## Decision
 
-In addition to the requirements established in [ADR 0006](0006-datasets-data-variable-metadata.md), data variables containing flag values MUST provide metadata defining their meanings using the flag attributes specified by the CF Conventions.
+In addition to the requirements established in [ADR 0004](0004-datasets-data-variable-metadata.md), data variables containing flag values MUST provide metadata defining their meanings using the flag attributes specified by the CF Conventions.
 
-This decision extends ADR 0006 without replacing or changing any of its requirements.
+This decision extends ADR 0004 without replacing or changing any of its requirements.
 
 ### Rules
 
@@ -35,4 +35,4 @@ Source data containing flag values must provide sufficient metadata to interpret
 
 Data that contains flag values but lacks the required flag metadata must be normalized before it can be processed as valid source data.
 
-Both enumerated and bitwise flags can be represented using CF-compatible metadata. All existing requirements of ADR 0006, including explicit `units`, continue to apply.
+Both enumerated and bitwise flags can be represented using CF-compatible metadata. All existing requirements of ADR 0004, including explicit `units`, continue to apply.
