@@ -20,8 +20,6 @@ The conversion tool adopts a constrained interpretation of CF spatial metadata i
 
 The CRS MUST be represented by a single CF grid-mapping variable referenced by all spatial data variables. The horizontal dimensions MUST be explicitly identifiable through one-dimensional coordinate variables carrying the CF axis attributes.
 
-Datasets that do not satisfy these requirements MUST be rejected as invalid spatial source data.
-
 ### Rules
 
 Valid spatial source data MUST satisfy the following requirements:
