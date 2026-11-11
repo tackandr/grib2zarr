@@ -134,25 +134,25 @@ A coordinate is not required to contain both metadata mappings unless specifical
 
 ### 3. Metadata associated with geometries
 
-Geometries may contain GRIB2 grid metadata and CF spatial metadata.
+The dataset's single geometry may contain GRIB2 grid metadata and CF spatial metadata.
 
 Example:
 
 ```yaml
-geometries:
-  - projection: &projection
-      name: projection
-      grib2:
-        gridDefinitionTemplateNumber: 30
-      cf:
-        crs:
-          grid_mapping_name: lambert_conformal_conic
-          standard_parallel: [63.3, 63.3]
-          longitude_of_central_meridian: 15.0
-          latitude_of_projection_origin: 63.3
-        coords:
-          - *y
-          - *x
+geometry:
+  projection: &projection
+    name: projection
+    grib2:
+      gridDefinitionTemplateNumber: 30
+    cf:
+      crs:
+        grid_mapping_name: lambert_conformal_conic
+        standard_parallel: [63.3, 63.3]
+        longitude_of_central_meridian: 15.0
+        latitude_of_projection_origin: 63.3
+      coords:
+        - *y
+        - *x
 ```
 
 The `grib2` mapping identifies or describes the grid representation used in the source data.

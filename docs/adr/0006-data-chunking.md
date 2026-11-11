@@ -24,7 +24,7 @@ We do not impose restrictions on the dimensions along which input data variables
 
 ### Rules
 
-The following requirements apply to `fmi_dask` processing functions:
+The following requirements apply to processing functions that operate on data variables:
 
 - Each input data variable MAY be chunked along ANY of its dimensions.
 - Each input data variable MAY be sharded along ANY of its dimensions.

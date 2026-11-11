@@ -137,7 +137,7 @@ Deserialization must:
 - Reject unsupported YAML tags.
 - Reject cyclic structures.
 
-YAML aliases must resolve to declared definitions as established in ADR-0002.
+YAML aliases must resolve to declared definitions as established in ADR-0008.
 
 The parser must not depend on retaining YAML anchor names after deserialization.
 
@@ -151,11 +151,11 @@ The root document must contain three sections:
 
 ```yaml
 coordinates: []
-geometries: []
+geometry: {}
 variables: []
 ```
 
-Each section must be a sequence.
+`coordinates` and `variables` must be sequences. `geometry` must be a mapping containing exactly one geometry definition.
 
 Unknown top-level sections are rejected.
 
@@ -187,13 +187,13 @@ The parser must verify that:
 
 Each geometry must contain:
 
-- A unique name.
+- A name.
 - A CF coordinate reference system definition.
 - References to its spatial coordinates.
 
 The parser must verify that:
 
-- Geometry names are unique.
+- The `geometry` section contains exactly one definition.
 - The outer definition key matches the `name` property.
 - The CRS definition is a mapping.
 - The CRS contains a `grid_mapping_name`.
@@ -214,7 +214,7 @@ The parser must verify that:
 
 - Variable names are unique.
 - Required GRIB2 properties are present.
-- The geometry reference resolves.
+- The geometry reference identifies the declared geometry.
 - All dimension references resolve.
 - Dimensions are not duplicated.
 - The dimension sequence is non-empty.
@@ -229,7 +229,7 @@ The parser must verify that:
 
 - Geometry coordinate references identify declared coordinates.
 - Variable dimension references identify declared coordinates.
-- Variable geometry references identify declared geometries.
+- Variable geometry references identify the declared geometry.
 - References point to the correct definition category.
 - Inline mappings are not accepted as substitutes for declared references.
 
@@ -483,7 +483,7 @@ Conceptually:
 ```text
 Configuration
 ├── coordinates: Coordinate[]
-├── geometries: Geometry[]
+├── geometry: Geometry
 └── variables: Variable[]
 ```
 

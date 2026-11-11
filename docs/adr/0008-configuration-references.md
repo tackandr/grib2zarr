@@ -94,7 +94,7 @@ Changing an anchor name does not change the meaning of the configuration, provid
 
 Coordinate names must be unique within the `coordinates` section.
 
-Geometry names must be unique within the `geometries` section.
+Geometry names are not repeated across definitions because the `geometry` section contains exactly one geometry definition.
 
 Variable names must be unique within the `variables` section.
 
@@ -137,15 +137,15 @@ coordinates:
 A geometry can reference these coordinates:
 
 ```yaml
-geometries:
-  - projection: &projection
-      name: projection
-      cf:
-        crs:
-          grid_mapping_name: lambert_conformal_conic
-        coords:
-          - *y
-          - *x
+geometry:
+  projection: &projection
+    name: projection
+    cf:
+      crs:
+        grid_mapping_name: lambert_conformal_conic
+      coords:
+        - *y
+        - *x
 ```
 
 A variable can reference the same coordinates:
@@ -170,15 +170,15 @@ Variables reference geometry definitions through the `geometry` property.
 Example:
 
 ```yaml
-geometries:
-  - projection: &projection
-      name: projection
-      cf:
-        crs:
-          grid_mapping_name: lambert_conformal_conic
-        coords:
-          - *y
-          - *x
+geometry:
+  projection: &projection
+    name: projection
+    cf:
+      crs:
+        grid_mapping_name: lambert_conformal_conic
+      coords:
+        - *y
+        - *x
 
 variables:
   - name: example
@@ -188,7 +188,7 @@ variables:
       - *x
 ```
 
-The `geometry` property must reference a geometry declared in the top-level `geometries` section.
+The `geometry` property must reference the geometry declared in the top-level `geometry` section.
 
 Multiple variables may reference the same geometry.
 
@@ -246,9 +246,9 @@ Conceptually, reference resolution proceeds as follows:
 
 1. Deserialize the YAML document.
 2. Identify the coordinate definitions in `coordinates`.
-3. Identify the geometry definitions in `geometries`.
+3. Identify the geometry definition in `geometry`.
 4. Associate each declared definition's deserialized mapping identity with its name.
-5. Inspect references in geometries and variables.
+5. Inspect references in the geometry and variables.
 6. Verify that each referenced mapping is one of the declared definitions of the expected category.
 7. Replace or normalize references into the corresponding definition names or internal objects.
 
@@ -366,11 +366,11 @@ The expected top-level order is:
 coordinates:
   # Coordinate definitions
 
-geometries:
-  # Geometry definitions referencing coordinates
+geometry:
+  # Geometry definition referencing coordinates
 
 variables:
-  # Variable definitions referencing geometries
+  # Variable definitions referencing the geometry
   # and coordinates
 ```
 
@@ -386,7 +386,7 @@ Examples include:
 
 - A variable dimension referring to an object that is not a declared coordinate.
 - A geometry coordinate referring to an object that is not a declared coordinate.
-- A variable geometry referring to an object that is not a declared geometry.
+- A variable geometry referring to an object that is not the declared geometry.
 - An inline mapping being used where a reference is required.
 - A duplicate coordinate reference in a variable's dimensions.
 - A duplicate coordinate reference in a geometry.
@@ -404,8 +404,8 @@ Or:
 ```text
 ConfigurationError:
 variables[0].geometry:
-Expected a reference to a geometry declared
-in the geometries section.
+Expected a reference to the geometry declared
+in the geometry section.
 ```
 
 Undefined YAML aliases are rejected during YAML deserialization.

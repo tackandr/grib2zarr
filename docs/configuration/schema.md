@@ -51,7 +51,7 @@ A configuration is a YAML document containing three top-level sections:
 
 ```yaml
 coordinates: []
-geometries: []
+geometry: {}
 variables: []
 ```
 
@@ -60,14 +60,15 @@ variables: []
 | Property | Type | Required | Description |
 |---|---|---|---|
 | `coordinates` | sequence | Yes | Coordinate definitions |
-| `geometries` | sequence | Yes | Geometry definitions |
+| `geometry` | mapping | Yes | Single geometry definition |
 | `variables` | sequence | Yes | Variable definitions |
 
 ### 2.2 Constraints
 
 - The root must be a YAML mapping.
 - All three sections must exist.
-- Each section must contain a YAML sequence.
+- `coordinates` and `variables` must contain YAML sequences.
+- `geometry` must contain a YAML mapping with exactly one entry.
 - At least one variable must be defined.
 - Unknown top-level properties are not permitted.
 - Mapping keys are case-sensitive.
@@ -78,7 +79,7 @@ The configuration uses YAML anchors and aliases to reference definitions.
 Because YAML aliases must refer to previously defined anchors, the conventional section order is:
 
 1. `coordinates`
-2. `geometries`
+2. `geometry`
 3. `variables`
 
 The parser must not depend on the textual ordering of top-level mapping keys beyond YAML's alias-resolution requirements.
@@ -351,32 +352,32 @@ The parser does not verify all CF standard-name or unit compatibility requiremen
 
 ---
 
-## 4. Geometries
+## 4. Geometry
 
-The `geometries` section defines the spatial geometries associated with variables.
+The `geometry` section defines the single spatial geometry of the dataset.
 
-A geometry describes a coordinate reference system and references the spatial coordinates defining its grid.
+All spatial variables use this geometry, consistent with ADR-0001. A geometry describes a coordinate reference system and references the spatial coordinates defining its grid.
 
 ### 4.1 Structure
 
 ```yaml
-geometries:
-  - projection: &projection
-      name: projection
-      grib2:
-        gridDefinitionTemplateNumber: 30
-      cf:
-        crs:
-          grid_mapping_name: lambert_conformal_conic
-          standard_parallel: [63.3, 63.3]
-          longitude_of_central_meridian: 15.0
-          latitude_of_projection_origin: 63.3
-        coords:
-          - *y
-          - *x
+geometry:
+  projection: &projection
+    name: projection
+    grib2:
+      gridDefinitionTemplateNumber: 30
+    cf:
+      crs:
+        grid_mapping_name: lambert_conformal_conic
+        standard_parallel: [63.3, 63.3]
+        longitude_of_central_meridian: 15.0
+        latitude_of_projection_origin: 63.3
+      coords:
+        - *y
+        - *x
 ```
 
-Each geometry is represented by a single-key mapping.
+The `geometry` mapping contains a single key, which is the geometry identifier.
 
 ### 4.2 Properties
 
@@ -395,7 +396,7 @@ Unknown properties outside the `grib2` and `cf` mappings are not permitted.
 
 The outer mapping key must match the `name` property.
 
-Geometry names must be unique within the `geometries` section.
+The `geometry` section contains exactly one geometry definition.
 
 The YAML anchor name is not part of geometry identity.
 
@@ -618,7 +619,7 @@ Comprehensive CF compliance validation is outside the parser's scope.
 
 ### 5.6 Geometry reference
 
-The `geometry` property references a geometry declared in the `geometries` section.
+The `geometry` property references the geometry declared in the `geometry` section.
 
 Example:
 
@@ -628,7 +629,7 @@ geometry: *projection
 
 Constraints:
 
-- Must reference a declared geometry.
+- Must reference the declared geometry.
 - Inline geometry definitions are not permitted.
 - Multiple variables may reference the same geometry.
 
@@ -735,7 +736,7 @@ A variable containing only spatial dimensions requires one GRIB2 message.
 
 The configuration uses YAML anchors and aliases to reference coordinates and geometries.
 
-Reference semantics are defined by ADR-0002.
+Reference semantics are defined by ADR-0008.
 
 ### 6.1 Declaring references
 
@@ -759,7 +760,7 @@ dims:
 
 | Property | Required reference type |
 |---|---|
-| `geometries[].*.cf.coords[]` | Coordinate |
+| `geometry.*.cf.coords[]` | Coordinate |
 | `variables[].geometry` | Geometry |
 | `variables[].dims[]` | Coordinate |
 
@@ -1143,8 +1144,8 @@ Conceptually:
 Configuration
 ├── coordinates
 │   └── Coordinate[]
-├── geometries
-│   └── Geometry[]
+├── geometry
+│   └── Geometry
 └── variables
     └── Variable[]
 ```
@@ -1227,6 +1228,7 @@ Validation is performed in multiple stages.
 ### 11.2 Structural validation
 
 - Required root sections.
+- Exactly one geometry definition.
 - Correct property types.
 - Required properties.
 - Valid definition structures.
@@ -1377,20 +1379,20 @@ coordinates:
       values: "[y * 2500 for y in range(3)]"
       chunk: 3
 
-geometries:
-  - projection: &projection
-      name: projection
-      grib2:
-        gridDefinitionTemplateNumber: 30
-      cf:
-        crs:
-          grid_mapping_name: lambert_conformal_conic
-          standard_parallel: [63.3, 63.3]
-          longitude_of_central_meridian: 15.0
-          latitude_of_projection_origin: 63.3
-        coords:
-          - *y
-          - *x
+geometry:
+  projection: &projection
+    name: projection
+    grib2:
+      gridDefinitionTemplateNumber: 30
+    cf:
+      crs:
+        grid_mapping_name: lambert_conformal_conic
+        standard_parallel: [63.3, 63.3]
+        longitude_of_central_meridian: 15.0
+        latitude_of_projection_origin: 63.3
+      coords:
+        - *y
+        - *x
 
 variables:
   - name: wind_speed
@@ -1474,7 +1476,7 @@ An implementation conforms to this specification when it:
 8. Enforces expression resource limits.
 9. Preserves GRIB2 and CF metadata.
 10. Validates required properties and supported types.
-11. Validates variable-to-geometry relationships.
+11. Validates variable-to-geometry relationships and rejects more than one geometry definition.
 12. Derives variable shapes and chunk shapes.
 13. Derives message dimensions.
 14. Produces a normalized configuration independent of YAML syntax.
@@ -1482,7 +1484,7 @@ An implementation conforms to this specification when it:
 16. Does not require GRIB input files during parsing.
 17. Does not perform GRIB decoding or Zarr writing.
 
-Message selection and assignment validation are separate conversion-stage requirements defined in ADR-0004.
+Message selection and assignment validation are separate conversion-stage requirements defined in ADR-0010, sections 8 and 10.
 
 ---
 

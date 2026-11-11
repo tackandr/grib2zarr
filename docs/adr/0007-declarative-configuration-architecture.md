@@ -37,11 +37,11 @@ The configuration will consist of three top-level sections:
 
 ```yaml
 coordinates: []
-geometries: []
+geometry: {}
 variables: []
 ```
 
-Each section contains a sequence of definitions.
+The `coordinates` and `variables` sections each contain a sequence of definitions. The `geometry` section contains exactly one geometry definition.
 
 ### Coordinates
 
@@ -58,7 +58,7 @@ A coordinate definition may contain:
 
 Coordinates describe the dimensions along which variable data is organized.
 
-Coordinate definitions can be reused by multiple variables and geometries.
+Coordinate definitions can be reused by multiple variables and by the geometry.
 
 Example:
 
@@ -74,36 +74,36 @@ coordinates:
       chunk: 3
 ```
 
-### Geometries
+### Geometry
 
-The `geometries` section defines the spatial geometry associated with variables.
+The `geometry` section defines the single spatial geometry of the output dataset.
+
+All spatial data variables use this geometry. A dataset has exactly one grid and one coordinate reference system, consistent with ADR-0001.
 
 A geometry definition may contain:
 
-- A unique name.
+- A name.
 - GRIB2 grid identification metadata.
 - A coordinate reference system described using CF grid mapping attributes.
 - References to the spatial coordinates defining the geometry.
 
-Geometry definitions can be shared by multiple variables.
-
 Example:
 
 ```yaml
-geometries:
-  - projection: &projection
-      name: projection
-      grib2:
-        gridDefinitionTemplateNumber: 30
-      cf:
-        crs:
-          grid_mapping_name: lambert_conformal_conic
-          standard_parallel: [63.3, 63.3]
-          longitude_of_central_meridian: 15.0
-          latitude_of_projection_origin: 63.3
-        coords:
-          - *y
-          - *x
+geometry:
+  projection: &projection
+    name: projection
+    grib2:
+      gridDefinitionTemplateNumber: 30
+    cf:
+      crs:
+        grid_mapping_name: lambert_conformal_conic
+        standard_parallel: [63.3, 63.3]
+        longitude_of_central_meridian: 15.0
+        latitude_of_projection_origin: 63.3
+      coords:
+        - *y
+        - *x
 ```
 
 ### Variables
@@ -115,7 +115,7 @@ A variable definition may contain:
 - A unique name.
 - GRIB2 metadata identifying the source parameter.
 - CF metadata describing the output variable.
-- A reference to its spatial geometry.
+- A reference to the geometry.
 - An ordered list of coordinate dimensions.
 
 Example:
@@ -159,7 +159,7 @@ The converter determines how to process GRIB messages to produce the specified d
 Coordinates, geometries, and variables are modeled as separate entities because they represent different concepts.
 
 - Coordinates describe dimension values and their metadata.
-- Geometries describe spatial reference systems and spatial coordinate relationships.
+- Geometry describes the spatial reference system and spatial coordinate relationships.
 - Variables describe meteorological fields and their multidimensional organization.
 
 This separation allows the same coordinates and geometries to be shared by multiple variables without duplicating their definitions.
